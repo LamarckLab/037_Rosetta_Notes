@@ -29,7 +29,8 @@ python -c "import pyrosetta; pyrosetta.init('-mute all'); print('PyRosetta OK')"
 **236 机子路径**
 > 输入目录：/data/lmk/rosetta_inputs  &nbsp;（待评估的复合物 pdb）
 > 输出目录：/data/lmk/rosetta_outputs  &nbsp;（relax 后结构 + 指标 csv）
-> 脚本目录：/data/lmk/rosetta_tutorial  &nbsp;（.ipynb 与 .py）
+> 教程目录：/data/lmk/rosetta_tutorial  &nbsp;（tutorial.ipynb）
+> 脚本目录：/data/lmk/rosetta_scripts  &nbsp;（生产脚本 .py）
 
 ## 06  在 conda 环境中配置并远程访问 JupyterLab
 > 服务器与内核是解耦的：`jupyterlab` 提供服务器，`ipykernel` 让某个环境注册成为可选内核，一个 server 可挂多个内核，在网页上切换，新建一个环境 & 内核需要做

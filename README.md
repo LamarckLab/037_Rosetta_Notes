@@ -17,7 +17,8 @@
 | :------------------------------------------------------- | :------------------------------------------------------------------------ |
 | [Rosetta_Setup.md](./Rosetta_Setup.md)                   | conda 环境、依赖与 PyRosetta 安装、验证、工作目录、JupyterLab 启动        |
 | [tutorial/](./tutorial/)                                 | PyRosetta 入门教程 notebook：Pose / ScoreFunction / Mover / ResidueSelector / InterfaceAnalyzer |
-| [Rosetta_Functions.md](./Rosetta_Functions.md)           | 各功能代码：结构打分 / FastRelax / 界面分析 / 逐残基能量 / ddG 扫描 / 批量并行 |
+| [Rosetta_Functions.md](./Rosetta_Functions.md)           | 生产用法：批量计算界面结合能 / 重复采样 / 多进程并行 / ddG 扫描 |
+| [scripts/](./scripts/)                                   | 生产脚本：批量计算界面结合能                                             |
 | [Rosetta_Metrics_Format.md](./Rosetta_Metrics_Format.md) | InterfaceAnalyzer 输出字段参考                                           |
 | [input_data/](./input_data/)                             | 各功能测试用输入文件                                                     |
 
