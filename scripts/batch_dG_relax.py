@@ -1,4 +1,4 @@
-"""批量计算复合物的界面结合能 dG_separated。
+"""批量计算复合物的结合能 ΔG（dG_separated）。
 
 读 PDB -> 只 relax 界面残基的侧链 -> InterfaceAnalyzer -> 追加一行到 CSV
 """
@@ -6,8 +6,9 @@
 # ==================== 配置（日常改这里） ====================
 
 INPUTS    = '/data/lmk/rosetta_inputs'                          # 待评估的复合物 pdb 目录
-OUTPUT    = '/data/lmk/rosetta_outputs/interface_metrics.csv'   # 指标输出
-INTERFACE = 'HL_A'      # 链分组，下划线左右各一组；要与 pdb 里的实际链号一致
+OUTPUT    = '/data/lmk/rosetta_outputs/dG_relax_results.csv'          # 指标输出
+INTERFACE = 'HL_A'      # 链分组，要与 pdb 实际链号一致
+                        # ⚠️ 左边必须是抗体、右边是抗原，否则 CSV 里两侧的列名会对调
 RADIUS    = 8.0         # 界面判定半径 A
 
 # ===========================================================
@@ -28,8 +29,9 @@ from pyrosetta.rosetta.protocols.docking import setup_foldtree
 from pyrosetta.rosetta.protocols.relax import FastRelax
 from pyrosetta.rosetta.utility import vector1_int
 
-FIELDS = ['pdb', 'nres', 'nres_iface', 'dG_separated', 'dSASA',
-          'total_score', 'relax_s', 'ia_s']
+FIELDS = ['pdb_id', 'nres', 'nres_relax', 'nres_antibody', 'nres_antigen',
+          'E_complex(REU)', 'E_antibody(REU)', 'E_antigen(REU)', 'dG(REU)',
+          'dSASA_int(A^2)', 'relax_time(s)', 'analyze_time(s)']
 
 
 def chains_selector(chains):
@@ -85,14 +87,18 @@ def evaluate(path, spec, radius, scorefxn):
     t_ia = time.time() - t0
 
     return {
-        'pdb': os.path.basename(path),
+        'pdb_id': os.path.basename(path),
         'nres': pose.total_residue(),
-        'nres_iface': len(idx),
-        'dG_separated': round(ia.get_interface_dG(), 2),
-        'dSASA': round(ia.get_interface_delta_sasa(), 1),
-        'total_score': round(scorefxn(pose), 2),
-        'relax_s': round(t_relax),
-        'ia_s': round(t_ia),
+        'nres_relax': len(idx),
+        'nres_antibody': ia.get_side1_nres(),       # side1 = INTERFACE 下划线左边那组
+        'nres_antigen': ia.get_side2_nres(),        # side2 = 右边那组
+        'E_complex(REU)': round(ia.get_complex_energy(), 2),
+        'E_antibody(REU)': round(ia.get_side1_score(), 2),
+        'E_antigen(REU)': round(ia.get_side2_score(), 2),
+        'dG(REU)': round(ia.get_interface_dG(), 2),
+        'dSASA_int(A^2)': round(ia.get_interface_delta_sasa(), 1),
+        'relax_time(s)': round(t_relax),
+        'analyze_time(s)': round(t_ia),
     }
 
 
@@ -135,8 +141,8 @@ def main():
                 row = evaluate(path, args.interface, args.radius, scorefxn)
                 w.writerow(row)
                 f.flush()        # 每条都落盘，中断不丢已完成的
-                print(f"[{n}/{len(todo)}] {name}  dG={row['dG_separated']}  "
-                      f"({row['relax_s'] + row['ia_s']} s)")
+                print(f"[{n}/{len(todo)}] {name}  dG={row['dG(REU)']}  "
+                      f"({row['relax_time(s)'] + row['analyze_time(s)']} s)")
             except Exception as e:
                 print(f'[{n}/{len(todo)}] {name}  失败: {type(e).__name__}: {e}')
 
