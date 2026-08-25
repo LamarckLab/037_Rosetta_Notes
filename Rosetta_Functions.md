@@ -107,7 +107,9 @@ python /data/lmk/rosetta_scripts/batch_dG_repack.py
 | **怎么分开**    | **`split_by_chain()` 真拆成两个 Pose** | **沿 jump 平移到远处**               |
 | 分离态          | 两个子 Pose 各 repack 同一批 → 打分    | `pack_separated=True` 再 repack      |
 
-界面判据对齐之后，主要只剩两条差异：**分开方式**（真拆成两个 Pose vs 平移到远处），以及 **repack 本身是模拟退火**，同一批残基跑两遍也不会落在完全相同的解上。
+界面判据对齐之后，两条路的差异只剩**分开方式**：脚本真拆成两个 Pose，IA 沿 jump 平移到远处。repack 的随机性可以排除 —— 实测同一批残基连跑三次，干净结构逐位相同，最差的结构也只差 0.2 REU。
+
+⚠️ 但分开方式并不足以解释实测到的分歧幅度：多数结构两列只差零点几 REU，个别结构却差到几十 REU 且变号。**成因待查。** 在查清之前，把分歧大的结构直接判为不可用。
 
 所以 `dG_IA` 这一列的作用是**可靠性探针**：两个数越接近，说明该结构的 ΔG 越不受实现细节影响。分歧大到会改变设计之间的排序时，用 04 的重复采样取均值。
 
@@ -155,15 +157,39 @@ python /data/lmk/rosetta_scripts/batch_dG_repack_relax.py
 | `dSASA_int(A^2)`                                 | 分开前后溶剂可及面积之差，即界面埋藏的面积                              |
 | `total_time(s)`                                  | 该结构从读 PDB 到算完的总耗时                                           |
 
-> **04 重复采样与统计**
+> **04 重复采样与并行**
 
-待补充
+生产级别脚本：batch_dG_pipeline.py
 
-> **05 多进程并行**
+在 03 的基础上做两件事：**每个结构重复 `NSTRUCT` 遍取统计量**，以及**按结构切分到 `NPROC` 个进程上并行**。
 
-待补充
+```bash
+python /data/lmk/rosetta_scripts/batch_dG_pipeline.py
+```
 
-> **06 ΔΔG 突变扫描 / cartesian_ddG**
+**`dG` 各列取的是 InterfaceAnalyzer 的值**，即 03 CSV 里的 `dG_IA` 那条路，不是 03 的 `dG` 列。IA 是业界通用实现，所以这里不再加 `_IA` 后缀。03 之所以两条路都留，是为了拿到 `E_antibody` / `E_antigen`。
+
+PyRosetta 每个进程自动取随机种子（`run:constant_seed = False`），同进程内连续调用也在推进 RNG，所以不需要手动管种子。
+
+### `--nproc` 怎么定
+
+Rosetta 是**单线程 CPU 密集型**，一个进程占一个核心，进程数直接等于占用的核心数。实际取 `min(--nproc, 待算结构数)`。
+
+### 输出 csv 的列
+
+| 列                            | 含义                                     |
+| :---------------------------- | :--------------------------------------- |
+| `pdb_id`                      | 文件名                                   |
+| `residues_num_*`              | 与 03 相同的四列残基数                   |
+| `nstruct`                     | 实际重复了几遍                           |
+| **`dG_mean(REU)`**            | **ΔG 均值，排序看这一列**（来自 IA）     |
+| **`dG_std(REU)`**             | **标准差，两个设计的差距要大于它才可信** |
+| `dG_min(REU)` / `dG_max(REU)` | 采样区间，一眼看出最坏情况               |
+| `dG_all(REU)`                 | 每一遍的原始值，分号分隔，留着重新统计   |
+| `dSASA_int_mean(A^2)`         | 界面埋藏面积的均值                       |
+| `total_time(s)`               | 该结构 `nstruct` 遍加起来的总耗时        |
+
+> **05 ΔΔG 突变扫描 / cartesian_ddG**
 
 待补充
 
