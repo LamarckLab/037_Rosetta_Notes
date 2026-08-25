@@ -7,7 +7,7 @@
 # ==================== 配置（日常改这里） ====================
 
 INPUTS    = '/data/lmk/rosetta_inputs'                          # 待评估的复合物 pdb 目录
-OUTPUT    = '/data/lmk/rosetta_outputs/dG_no_relax_results.csv'  # 指标输出
+OUTPUT    = '/data/lmk/rosetta_outputs/dG_results.csv'  # 指标输出
 INTERFACE = 'HL_A'      # 链分组，要与 pdb 实际链号一致
                         # ⚠️ 左边必须是抗体、右边是抗原，否则 CSV 里两侧的列名会对调
 
@@ -20,18 +20,41 @@ import os
 import time
 
 import pyrosetta
+from pyrosetta.rosetta.core.pose import append_pose_to_pose
 from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
 from pyrosetta.rosetta.protocols.docking import setup_foldtree
 from pyrosetta.rosetta.utility import vector1_int
 
 FIELDS = ['pdb_id', 'nres', 'nres_antibody', 'nres_antigen',
-          'E_complex(REU)', 'E_antibody(REU)', 'E_antigen(REU)', 'dG(REU)',
-          'dSASA_int(A^2)', 'analyze_time(s)']
+          'E_complex(REU)', 'E_antibody(REU)', 'E_antigen(REU)',
+          'dG(REU)', 'dG_IA(REU)', 'dSASA_int(A^2)', 'analyze_time(s)']
+
+
+def group_pose(pose, chains):
+    """把指定链号的残基拼成一个独立的 Pose"""
+    parts = pose.split_by_chain()
+    info = pose.pdb_info()
+    out = None
+    for k in range(1, pose.num_chains() + 1):
+        if info.chain(pose.chain_begin(k)) not in chains:
+            continue
+        if out is None:
+            out = parts[k].clone()
+        else:
+            append_pose_to_pose(out, parts[k], True)
+    out.conformation().detect_disulfides()    # 拆开后二硫键记录失效，必须重建
+    return out
 
 
 def evaluate(path, spec, scorefxn):
     """算一个结构，返回一行指标。结构原样使用，不做任何优化"""
     pose = pyrosetta.pose_from_pdb(path)
+
+    g1, g2 = spec.split('_')
+    pose_ab, pose_ag = group_pose(pose, g1), group_pose(pose, g2)    # 直接拆开，不做任何优化
+
+    e_complex = scorefxn(pose)
+    e_ab, e_ag = scorefxn(pose_ab), scorefxn(pose_ag)
 
     jumps = vector1_int()
     setup_foldtree(pose, spec, jumps)    # 重建 FoldTree，jump 1 分开两组链
@@ -49,12 +72,13 @@ def evaluate(path, spec, scorefxn):
     return {
         'pdb_id': os.path.basename(path),
         'nres': pose.total_residue(),
-        'nres_antibody': ia.get_side1_nres(),       # side1 = INTERFACE 下划线左边那组
-        'nres_antigen': ia.get_side2_nres(),        # side2 = 右边那组
-        'E_complex(REU)': round(ia.get_complex_energy(), 2),
-        'E_antibody(REU)': round(ia.get_side1_score(), 2),
-        'E_antigen(REU)': round(ia.get_side2_score(), 2),
-        'dG(REU)': round(ia.get_interface_dG(), 2),
+        'nres_antibody': pose_ab.total_residue(),
+        'nres_antigen': pose_ag.total_residue(),
+        'E_complex(REU)': round(e_complex, 2),
+        'E_antibody(REU)': round(e_ab, 2),
+        'E_antigen(REU)': round(e_ag, 2),
+        'dG(REU)': round(e_complex - e_ab - e_ag, 2),      # 自己算，三者必然自洽
+        'dG_IA(REU)': round(ia.get_interface_dG(), 2),     # InterfaceAnalyzer 的值，供对照
         'dSASA_int(A^2)': round(ia.get_interface_delta_sasa(), 1),
         'analyze_time(s)': round(t_ia, 1),
     }

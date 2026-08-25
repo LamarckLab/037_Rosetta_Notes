@@ -1,15 +1,15 @@
-"""批量计算复合物的结合能 ΔG（dG_separated）。
+"""批量计算复合物的结合能 ΔG —— 界面 relax + 分开后 repack。
 
-读 PDB -> 只 relax 界面残基的侧链 -> InterfaceAnalyzer -> 追加一行到 CSV
+选界面残基 -> 只 relax 这些侧链 -> 打分 -> 拆开两侧各自 repack -> 打分 -> 相减
 """
 
 # ==================== 配置（日常改这里） ====================
 
 INPUTS    = '/data/lmk/rosetta_inputs'                          # 待评估的复合物 pdb 目录
-OUTPUT    = '/data/lmk/rosetta_outputs/dG_relax_results.csv'          # 指标输出
+OUTPUT    = '/data/lmk/rosetta_outputs/dG_repack_relax_results.csv'    # 指标输出
 INTERFACE = 'HL_A'      # 链分组，要与 pdb 实际链号一致
                         # ⚠️ 左边必须是抗体、右边是抗原，否则 CSV 里两侧的列名会对调
-RADIUS    = 8.0         # 界面判定半径 A
+RADIUS    = 8.0         # 界面判定半径 A（CB 之间的距离）
 
 # ===========================================================
 
@@ -21,17 +21,24 @@ import time
 
 import pyrosetta
 from pyrosetta.rosetta.core.kinematics import MoveMap
+from pyrosetta.rosetta.core.pack.task import TaskFactory
+from pyrosetta.rosetta.core.pack.task.operation import (
+    IncludeCurrent, OperateOnResidueSubset, PreventRepackingRLT, RestrictToRepacking)
+from pyrosetta.rosetta.core.pose import append_pose_to_pose
 from pyrosetta.rosetta.core.select import get_residues_from_subset
 from pyrosetta.rosetta.core.select.residue_selector import (
-    AndResidueSelector, ChainSelector, NeighborhoodResidueSelector, OrResidueSelector)
+    AndResidueSelector, ChainSelector, NeighborhoodResidueSelector, NotResidueSelector,
+    OrResidueSelector, ResidueIndexSelector)
 from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
 from pyrosetta.rosetta.protocols.docking import setup_foldtree
+from pyrosetta.rosetta.protocols.minimization_packing import PackRotamersMover
 from pyrosetta.rosetta.protocols.relax import FastRelax
 from pyrosetta.rosetta.utility import vector1_int
 
 FIELDS = ['pdb_id', 'nres', 'nres_relax', 'nres_antibody', 'nres_antigen',
-          'E_complex(REU)', 'E_antibody(REU)', 'E_antigen(REU)', 'dG(REU)',
-          'dSASA_int(A^2)', 'relax_time(s)', 'analyze_time(s)']
+          'E_complex(REU)', 'E_antibody(REU)', 'E_antigen(REU)',
+          'dG(REU)', 'dG_IA(REU)', 'dSASA_int(A^2)',
+          'relax_time(s)', 'analyze_time(s)']
 
 
 def chains_selector(chains):
@@ -50,6 +57,35 @@ def interface_residues(pose, spec, radius):
     side2 = AndResidueSelector(NeighborhoodResidueSelector(s1, radius, False), s2)
     return sorted(set(get_residues_from_subset(side1.apply(pose))) |
                   set(get_residues_from_subset(side2.apply(pose))))
+
+
+def group_pose(pose, chains):
+    """把指定链号的残基拼成一个独立的 Pose，同时返回原编号映射"""
+    parts = pose.split_by_chain()
+    info = pose.pdb_info()
+    out, orig = None, []
+    for k in range(1, pose.num_chains() + 1):
+        if info.chain(pose.chain_begin(k)) not in chains:
+            continue
+        orig += list(range(pose.chain_begin(k), pose.chain_end(k) + 1))
+        if out is None:
+            out = parts[k].clone()
+        else:
+            append_pose_to_pose(out, parts[k], True)
+    out.conformation().detect_disulfides()    # 拆开后二硫键记录失效，必须重建
+    return out, orig
+
+
+def repack(pose, scorefxn, subset):
+    """只 repack 指定残基的侧链，其余一律固定"""
+    tf = TaskFactory()
+    tf.push_back(RestrictToRepacking())                 # 不改序列
+    tf.push_back(IncludeCurrent())                      # 把当前构象也纳入候选，否则丢掉 relax 的最小化成果
+    keep = ResidueIndexSelector(','.join(map(str, subset)))
+    tf.push_back(OperateOnResidueSubset(PreventRepackingRLT(), NotResidueSelector(keep)))    # 只放开 subset
+    pack = PackRotamersMover(scorefxn)
+    pack.task_factory(tf)
+    pack.apply(pose)
 
 
 def evaluate(path, spec, radius, scorefxn):
@@ -74,28 +110,46 @@ def evaluate(path, spec, radius, scorefxn):
     fr.apply(pose)
     t_relax = time.time() - t0
 
+    pose_ia = pose.clone()           # 留一份 relax 后的原样，供 IA 独立计算
+
+    t0 = time.time()
+    repack(pose, scorefxn, idx)      # 结合态也做一次同范围 repack，与分离态对等
+    e_complex = scorefxn(pose)
+
+    g1, g2 = spec.split('_')
+    iface = set(idx)
+    pose_ab, orig_ab = group_pose(pose, g1)                          # 拆开
+    pose_ag, orig_ag = group_pose(pose, g2)
+
+    # 界面残基在子 Pose 里的新编号；只 repack 它们，与复合物侧 relax 的范围保持一致
+    sub_ab = [j for j, o in enumerate(orig_ab, 1) if o in iface]
+    sub_ag = [j for j, o in enumerate(orig_ag, 1) if o in iface]
+    repack(pose_ab, scorefxn, sub_ab)
+    repack(pose_ag, scorefxn, sub_ag)
+    e_ab, e_ag = scorefxn(pose_ab), scorefxn(pose_ag)
+
     jumps = vector1_int()
-    setup_foldtree(pose, spec, jumps)    # 重建 FoldTree，jump 1 分开两组链
+    setup_foldtree(pose_ia, spec, jumps)   # 重建 FoldTree，jump 1 分开两组链
 
     ia = InterfaceAnalyzerMover(1)
     ia.set_scorefunction(scorefxn)
-    ia.set_pack_separated(True)          # 分开后重新 repack，模拟解离
-    ia.set_calc_dSASA(True)              # dSASA 默认不算，要显式打开
-
-    t0 = time.time()
-    ia.apply(pose)
+    ia.set_pack_input(True)                # 两侧都 repack 才对称，缺一侧 dG 会偏移几十 REU
+    ia.set_pack_separated(True)
+    ia.set_calc_dSASA(True)
+    ia.apply(pose_ia)
     t_ia = time.time() - t0
 
     return {
         'pdb_id': os.path.basename(path),
-        'nres': pose.total_residue(),
+        'nres': pose_ia.total_residue(),
         'nres_relax': len(idx),
-        'nres_antibody': ia.get_side1_nres(),       # side1 = INTERFACE 下划线左边那组
-        'nres_antigen': ia.get_side2_nres(),        # side2 = 右边那组
-        'E_complex(REU)': round(ia.get_complex_energy(), 2),
-        'E_antibody(REU)': round(ia.get_side1_score(), 2),
-        'E_antigen(REU)': round(ia.get_side2_score(), 2),
-        'dG(REU)': round(ia.get_interface_dG(), 2),
+        'nres_antibody': pose_ab.total_residue(),
+        'nres_antigen': pose_ag.total_residue(),
+        'E_complex(REU)': round(e_complex, 2),
+        'E_antibody(REU)': round(e_ab, 2),
+        'E_antigen(REU)': round(e_ag, 2),
+        'dG(REU)': round(e_complex - e_ab - e_ag, 2),      # 自己算，三者必然自洽
+        'dG_IA(REU)': round(ia.get_interface_dG(), 2),     # InterfaceAnalyzer 的值，供对照
         'dSASA_int(A^2)': round(ia.get_interface_delta_sasa(), 1),
         'relax_time(s)': round(t_relax),
         'analyze_time(s)': round(t_ia),
@@ -107,7 +161,7 @@ def done_set(out_csv):
     if not os.path.exists(out_csv):
         return set()
     with open(out_csv, newline='', encoding='utf-8') as f:
-        return {row['pdb'] for row in csv.DictReader(f)}
+        return {row['pdb_id'] for row in csv.DictReader(f)}
 
 
 def main():
