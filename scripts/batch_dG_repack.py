@@ -1,7 +1,7 @@
 """批量计算复合物的结合能 ΔG —— 不 relax，只 repack（Rosetta 官方推荐的标准做法）。
 
 选界面残基 -> 结合态 repack -> 打分 -> 拆开两侧各自 repack -> 打分 -> 相减
-官方文档对非 Rosetta 来源的结构建议 pack_input + pack_separated，但不要求先 relax
+官方文档对非 Rosetta 来源的结构建议结合态与分离态都 repack，但不要求先 relax
 """
 
 # ==================== 配置（日常改这里） ====================
@@ -10,7 +10,8 @@ INPUTS    = '/data/lmk/rosetta_inputs'                          # 待评估的�
 OUTPUT    = '/data/lmk/rosetta_outputs/dG_repack_results.csv'    # 指标输出
 INTERFACE = 'HL_A'      # 链分组，要与 pdb 实际链号一致
                         # ⚠️ 左边必须是抗体、右边是抗原，否则 CSV 里两侧的列名会对调
-RADIUS    = 8.0         # 界面判定半径 A（CB 之间的距离），决定 repack 范围
+RADIUS    = 10.0        # 界面判定半径 A（CB 之间的距离），决定 repack 范围
+                        # 与 InterfaceAnalyzer 的默认值一致，改这里会同时改掉 IA 那一侧
 
 # ===========================================================
 
@@ -34,10 +35,10 @@ from pyrosetta.rosetta.protocols.docking import setup_foldtree
 from pyrosetta.rosetta.protocols.minimization_packing import PackRotamersMover
 from pyrosetta.rosetta.utility import vector1_int
 
-FIELDS = ['pdb_id', 'nres', 'nres_repack', 'nres_antibody', 'nres_antigen',
+FIELDS = ['pdb_id', 'residues_num_total', 'residues_num_interface',
+          'residues_num_antibody', 'residues_num_antigen',
           'E_complex(REU)', 'E_antibody(REU)', 'E_antigen(REU)',
-          'dG(REU)', 'dG_IA(REU)', 'dSASA_int(A^2)',
-          'repack_time(s)', 'analyze_time(s)']
+          'dG(REU)', 'dG_IA(REU)', 'dSASA_int(A^2)', 'total_time(s)']
 
 
 def chains_selector(chains):
@@ -89,18 +90,17 @@ def repack(pose, scorefxn, subset):
 
 def evaluate(path, spec, radius, scorefxn):
     """算一个结构，返回一行指标。并行时每个进程各自 init 并传入自己的 scorefxn"""
+    t0 = time.time()
     pose = pyrosetta.pose_from_pdb(path)
 
     idx = interface_residues(pose, spec, radius)
     if not idx:
         raise ValueError(f'界面为空，检查链分组 {spec} 是否与该文件匹配')
 
-    pose_ia = pose.clone()           # 留一份原样，供 IA 独立计算
+    pose_ia = pose.clone()           # 留一份原样，供 IA 独立走一遍完整流程
 
-    t0 = time.time()
     repack(pose, scorefxn, idx)      # 结合态 repack，与分离态对等
     e_complex = scorefxn(pose)
-    t_repack = time.time() - t0
 
     g1, g2 = spec.split('_')
     iface = set(idx)
@@ -117,28 +117,26 @@ def evaluate(path, spec, radius, scorefxn):
     jumps = vector1_int()
     setup_foldtree(pose_ia, spec, jumps)   # 重建 FoldTree，jump 1 分开两组链
 
-    ia = InterfaceAnalyzerMover(1)
+    ia = InterfaceAnalyzerMover(1)         # 独立走一遍，给出 dG_IA 与 dSASA
     ia.set_scorefunction(scorefxn)
     ia.set_pack_input(True)                # 两侧都 repack 才对称，缺一侧 dG 会偏移几十 REU
     ia.set_pack_separated(True)
     ia.set_calc_dSASA(True)
     ia.apply(pose_ia)
-    t_ia = time.time() - t0
 
     return {
         'pdb_id': os.path.basename(path),
-        'nres': pose_ia.total_residue(),
-        'nres_repack': len(idx),
-        'nres_antibody': pose_ab.total_residue(),
-        'nres_antigen': pose_ag.total_residue(),
+        'residues_num_total': pose_ia.total_residue(),
+        'residues_num_interface': len(idx),
+        'residues_num_antibody': pose_ab.total_residue(),
+        'residues_num_antigen': pose_ag.total_residue(),
         'E_complex(REU)': round(e_complex, 2),
         'E_antibody(REU)': round(e_ab, 2),
         'E_antigen(REU)': round(e_ag, 2),
-        'dG(REU)': round(e_complex - e_ab - e_ag, 2),      # 自己算，三者必然自洽
+        'dG(REU)': round(e_complex - e_ab - e_ag, 2),      # 与前三列必然自洽，可直接验算
         'dG_IA(REU)': round(ia.get_interface_dG(), 2),     # InterfaceAnalyzer 的值，供对照
         'dSASA_int(A^2)': round(ia.get_interface_delta_sasa(), 1),
-        'repack_time(s)': round(t_repack),
-        'analyze_time(s)': round(t_ia),
+        'total_time(s)': round(time.time() - t0, 1),
     }
 
 
@@ -158,7 +156,8 @@ def main():
     ap.add_argument('--radius', type=float, default=RADIUS)
     args = ap.parse_args()
 
-    pyrosetta.init('-mute all')
+    # 把 IA 的界面判定半径也设成 args.radius，两条路用同一个标准
+    pyrosetta.init(f'-mute all -pose_metrics:interface_cutoff {args.radius}')
     scorefxn = pyrosetta.get_fa_scorefxn()
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -182,7 +181,7 @@ def main():
                 w.writerow(row)
                 f.flush()        # 每条都落盘，中断不丢已完成的
                 print(f"[{n}/{len(todo)}] {name}  dG={row['dG(REU)']}  "
-                      f"({row['repack_time(s)'] + row['analyze_time(s)']} s)")
+                      f"({row['total_time(s)']} s)")
             except Exception as e:
                 print(f'[{n}/{len(todo)}] {name}  失败: {type(e).__name__}: {e}')
 

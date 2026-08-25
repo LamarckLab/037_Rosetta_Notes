@@ -1,7 +1,7 @@
 """批量计算复合物的结合能 ΔG —— 不做任何 relax 与 repack。
 
-直接对输入结构打分 -> 沿 jump 拆开 -> 直接打分 -> 相减
-作为 batch_dG_relax.py 的对照基线：数值不可靠，但快 50 倍
+直接对输入结构打分 -> 按链拆开 -> 直接打分 -> 相减
+作为 batch_dG_repack_relax.py 的对照基线：数值不可靠，但快 50 倍
 """
 
 # ==================== 配置（日常改这里） ====================
@@ -10,6 +10,8 @@ INPUTS    = '/data/lmk/rosetta_inputs'                          # 待评估的�
 OUTPUT    = '/data/lmk/rosetta_outputs/dG_results.csv'  # 指标输出
 INTERFACE = 'HL_A'      # 链分组，要与 pdb 实际链号一致
                         # ⚠️ 左边必须是抗体、右边是抗原，否则 CSV 里两侧的列名会对调
+RADIUS    = 10.0        # 界面判定半径 A（CB 之间的距离）
+                        # 01 不 repack，这里只决定 IA 的界面残基集合，即 dSASA 的统计口径
 
 # ===========================================================
 
@@ -25,9 +27,9 @@ from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
 from pyrosetta.rosetta.protocols.docking import setup_foldtree
 from pyrosetta.rosetta.utility import vector1_int
 
-FIELDS = ['pdb_id', 'nres', 'nres_antibody', 'nres_antigen',
+FIELDS = ['pdb_id', 'residues_num_total', 'residues_num_antibody', 'residues_num_antigen',
           'E_complex(REU)', 'E_antibody(REU)', 'E_antigen(REU)',
-          'dG(REU)', 'dG_IA(REU)', 'dSASA_int(A^2)', 'analyze_time(s)']
+          'dG(REU)', 'dG_IA(REU)', 'dSASA_int(A^2)', 'total_time(s)']
 
 
 def group_pose(pose, chains):
@@ -48,6 +50,7 @@ def group_pose(pose, chains):
 
 def evaluate(path, spec, scorefxn):
     """算一个结构，返回一行指标。结构原样使用，不做任何优化"""
+    t0 = time.time()
     pose = pyrosetta.pose_from_pdb(path)
 
     g1, g2 = spec.split('_')
@@ -59,28 +62,26 @@ def evaluate(path, spec, scorefxn):
     jumps = vector1_int()
     setup_foldtree(pose, spec, jumps)    # 重建 FoldTree，jump 1 分开两组链
 
-    ia = InterfaceAnalyzerMover(1)
+    ia = InterfaceAnalyzerMover(1)       # 独立走一遍，给出 dG_IA 与 dSASA
     ia.set_scorefunction(scorefxn)
     ia.set_pack_input(False)             # 复合物不 repack
     ia.set_pack_separated(False)         # 分开后也不 repack
     ia.set_calc_dSASA(True)
 
-    t0 = time.time()
     ia.apply(pose)
-    t_ia = time.time() - t0
 
     return {
         'pdb_id': os.path.basename(path),
-        'nres': pose.total_residue(),
-        'nres_antibody': pose_ab.total_residue(),
-        'nres_antigen': pose_ag.total_residue(),
+        'residues_num_total': pose.total_residue(),
+        'residues_num_antibody': pose_ab.total_residue(),
+        'residues_num_antigen': pose_ag.total_residue(),
         'E_complex(REU)': round(e_complex, 2),
         'E_antibody(REU)': round(e_ab, 2),
         'E_antigen(REU)': round(e_ag, 2),
-        'dG(REU)': round(e_complex - e_ab - e_ag, 2),      # 自己算，三者必然自洽
+        'dG(REU)': round(e_complex - e_ab - e_ag, 2),      # 与前三列必然自洽，可直接验算
         'dG_IA(REU)': round(ia.get_interface_dG(), 2),     # InterfaceAnalyzer 的值，供对照
         'dSASA_int(A^2)': round(ia.get_interface_delta_sasa(), 1),
-        'analyze_time(s)': round(t_ia, 1),
+        'total_time(s)': round(time.time() - t0, 1),
     }
 
 
@@ -97,9 +98,11 @@ def main():
     ap.add_argument('--inputs', default=INPUTS)
     ap.add_argument('--out', default=OUTPUT)
     ap.add_argument('--interface', default=INTERFACE, help='链分组，如 HL_A')
+    ap.add_argument('--radius', type=float, default=RADIUS)
     args = ap.parse_args()
 
-    pyrosetta.init('-mute all')
+    # 与 02 / 03 保持同一个界面判定半径
+    pyrosetta.init(f'-mute all -pose_metrics:interface_cutoff {args.radius}')
     scorefxn = pyrosetta.get_fa_scorefxn()
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -123,7 +126,7 @@ def main():
                 w.writerow(row)
                 f.flush()        # 每条都落盘，中断不丢已完成的
                 print(f"[{n}/{len(todo)}] {name}  dG={row['dG(REU)']}  "
-                      f"({row['analyze_time(s)']} s)")
+                      f"({row['total_time(s)']} s)")
             except Exception as e:
                 print(f'[{n}/{len(todo)}] {name}  失败: {type(e).__name__}: {e}')
 
