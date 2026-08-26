@@ -1,0 +1,219 @@
+"""第二级：对筛选后的突变跑官方 flex ddG，产出可报告的 ΔΔG。
+
+读第一级输出（人工筛过的）csv，逐个突变按 Kortemme 实验室的 ddG-backrub.xml
+跑 NSTRUCT 条 backrub 轨迹，取数与重加权照官方 analyze_flex_ddG.py。
+
+⚠️ 本档用 **talaris2014**，不是前几档的 REF2015 —— flex ddG 整套是在 talaris2014
+上标定的，实测换 ref2015 相关性会掉（r 0.79 -> 0.57~0.68，Sora 等 2023）。这需要
+整个进程开 -corrections::restore_talaris_behavior，所以只能独立进程跑。
+**本档的数字与 01-04 的 REU 不可比。**
+
+符号：ddG < 0 表示突变体结合更强。
+
+参考 https://github.com/Kortemme-Lab/flex_ddG_tutorial
+"""
+
+# ==================== 配置（日常改这里） ====================
+
+SELECTED  = '/data/lmk/rosetta_outputs/ddG_selected.csv'        # 人工筛过的突变清单
+PDB_DIR   = '/data/lmk/rosetta_inputs'                          # 按 pdb_id 到这里找结构
+OUTPUT    = '/data/lmk/rosetta_outputs/ddG_flex_results.csv'    # 指标输出
+XML       = '/data/lmk/rosetta_scripts/ddG-backrub.xml'         # 官方协议，原样保存
+WORK      = '/data/lmk/rosetta_work/flexddg'                    # 每条轨迹的临时 db3
+
+MOVE_CHAIN     = 'A'      # 算解离态时把哪条（组）链移开，一般就是抗原
+NSTRUCT        = 35       # 每个突变跑几条轨迹；官方推荐 35
+BACKRUB_TRIALS = 35000    # 每条轨迹的 backrub 步数；官方推荐 35000
+MAX_MIN_ITER   = 5000     # 官方 benchmark 值
+CONV_THRESH    = 1.0      # abs_score_convergence_thresh，官方值
+NPROC          = 32       # 最多同时跑几个进程
+
+# ===========================================================
+
+import argparse
+import csv
+import os
+import shutil
+import statistics
+import sys
+import time
+import traceback
+import multiprocessing as mp
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from flexddg_lib import ddG_from_db3
+
+KEYS = ['pdb_id', 'chain', 'pdb_position', 'wt_aa', 'mut_aa']
+FIELDS = KEYS + ['ddG_gam_mean(kcal/mol)', 'ddG_gam_std', 'ddG_raw_mean(REU)',
+                 'ddG_raw_std', 'nstruct_done', 'backrub_trials', 'cpu_time(s)']
+
+_XML = None      # 每个 worker 读一次模板
+_POSE = {}       # 每个 worker 缓存已读过的 pdb
+
+
+def tag_of(row):
+    return f"{row['pdb_id']}:{row['chain']}{row['pdb_position']}{row['mut_aa']}"
+
+
+def init_worker(xml_path, work, opts):
+    """每个 worker 起来时跑一次。注意这里进的是 talaris 模式，全局生效"""
+    global _XML
+    import pyrosetta
+    # -inout:dbms:database_name 必须给个值（否则 ReportToDB 构建时报 inactive option），
+    # 但真正写哪个库由 XML 里的 database_name 属性决定，逐条轨迹各写各的
+    pyrosetta.init(
+        '-mute all -corrections::restore_talaris_behavior true '
+        '-inout:dbms:mode sqlite3 '
+        f'-inout:dbms:database_name {work}/unused.db3 '
+        '-in:file:fullatom -ignore_unrecognized_res '
+        '-ignore_zero_occupancy false -ex1 -ex2', silent=True)
+    _XML = open(xml_path).read()
+
+
+def load(path):
+    import pyrosetta
+    if path not in _POSE:
+        _POSE[path] = pyrosetta.pose_from_pdb(path)
+    return _POSE[path]
+
+
+def run_trajectory(task):
+    """跑一条 backrub 轨迹，返回这一条的 ΔΔG"""
+    from pyrosetta.rosetta.protocols.rosetta_scripts import XmlObjects
+
+    row, k, pdb_path, work, opts = task
+    t0 = time.time()
+    tag = f"{row['pdb_id'][:-4]}_{row['chain']}{row['pdb_position']}{row['mut_aa']}_{k}"
+    d = os.path.join(work, tag)
+    try:
+        os.makedirs(d, exist_ok=True)
+        resfile = os.path.join(d, 'mutate.resfile')
+        with open(resfile, 'w') as f:                       # 官方 resfile 格式
+            f.write(f"NATAA\nstart\n{row['pdb_position']} {row['chain']} "
+                    f"PIKAA {row['mut_aa']}\n")
+
+        db3 = os.path.join(d, 'ddG.db3')
+        xml = (_XML.replace('database_name="ddG.db3"', f'database_name="{db3}"')
+                   .replace('database_name="struct.db3"',
+                            f'database_name="{os.path.join(d, "struct.db3")}"'))
+        for key, val in {'mutate_resfile_relpath': resfile,
+                         'chainstomove': opts['move_chain'],
+                         'number_backrub_trials': str(opts['trials']),
+                         'backrub_trajectory_stride': str(opts['trials']),
+                         'max_minimization_iter': str(opts['min_iter']),
+                         'abs_score_convergence_thresh': str(opts['conv'])}.items():
+            xml = xml.replace(f'%%{key}%%', val)
+
+        pose = load(pdb_path).clone()
+        XmlObjects.create_from_string(xml).get_mover('ParsedProtocol').apply(pose)
+        gam, raw, _ = ddG_from_db3(db3)
+        return {'key': tag_of(row), 'gam': gam, 'raw': raw,
+                'sec': time.time() - t0}
+    except Exception:
+        return {'key': tag_of(row), '_error': traceback.format_exc()}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)     # db3 很占地方，取完数就删
+
+
+def done_set(out_csv):
+    if not os.path.exists(out_csv):
+        return set()
+    with open(out_csv, newline='', encoding='utf-8') as f:
+        return {tag_of(r) for r in csv.DictReader(f)}
+
+
+def summarize(row, vals, trials):
+    """把一个突变的 nstruct 条轨迹汇总成一行"""
+    gams = [v['gam'] for v in vals]
+    raws = [v['raw'] for v in vals]
+    two = len(vals) > 1
+    return {
+        **{k: row[k] for k in KEYS},
+        'ddG_gam_mean(kcal/mol)': round(statistics.fmean(gams), 3),
+        'ddG_gam_std': round(statistics.stdev(gams), 3) if two else 0.0,
+        'ddG_raw_mean(REU)': round(statistics.fmean(raws), 3),
+        'ddG_raw_std': round(statistics.stdev(raws), 3) if two else 0.0,
+        'nstruct_done': len(vals),
+        'backrub_trials': trials,
+        # 各条轨迹耗时之和，即这个突变真实占用的 CPU 时间；并行下墙钟没有可比性
+        'cpu_time(s)': round(sum(v['sec'] for v in vals), 1),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--selected', default=SELECTED, help='人工筛过的突变 csv')
+    ap.add_argument('--pdb-dir', default=PDB_DIR)
+    ap.add_argument('--out', default=OUTPUT)
+    ap.add_argument('--xml', default=XML)
+    ap.add_argument('--work', default=WORK)
+    ap.add_argument('--move-chain', default=MOVE_CHAIN, help='解离时移开哪条链')
+    ap.add_argument('--nstruct', type=int, default=NSTRUCT)
+    ap.add_argument('--trials', type=int, default=BACKRUB_TRIALS)
+    ap.add_argument('--nproc', type=int, default=NPROC)
+    args = ap.parse_args()
+
+    os.makedirs(args.work, exist_ok=True)
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+
+    with open(args.selected, newline='', encoding='utf-8') as f:
+        rows = [r for r in csv.DictReader(f)]
+    skip = done_set(args.out)
+    rows = [r for r in rows if tag_of(r) not in skip]
+    if not rows:
+        print('没有待算的突变')
+        return
+
+    opts = {'move_chain': args.move_chain, 'trials': args.trials,
+            'min_iter': MAX_MIN_ITER, 'conv': CONV_THRESH}
+    # 任务粒度 = 一条轨迹。若按突变切，每个任务几十小时，进程之间没法均衡
+    tasks = [(r, k, os.path.join(args.pdb_dir, r['pdb_id']), args.work, opts)
+             for r in rows for k in range(args.nstruct)]
+    by_key = {tag_of(r): r for r in rows}
+
+    print(f'{len(rows)} 个突变 × {args.nstruct} 条轨迹 = {len(tasks)} 个任务  |  '
+          f'{args.trials} backrub steps  |  {args.nproc} 进程\n'
+          f'⚠️ talaris2014 模式，本档结果与 01-04 的 REU 不可比')
+
+    t0 = time.time()
+    got, bad = {}, {}
+    new_file = not os.path.exists(args.out)
+    ctx = mp.get_context('spawn')
+
+    with open(args.out, 'a', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        if new_file:
+            w.writeheader()
+
+        with ctx.Pool(args.nproc, initializer=init_worker,
+                      initargs=(args.xml, args.work, opts)) as pool:
+            for n, res in enumerate(pool.imap_unordered(run_trajectory, tasks), 1):
+                key = res['key']
+                if '_error' in res:
+                    if key not in bad:               # 同一个突变只报一次
+                        bad[key] = True
+                        print(f"[{n}/{len(tasks)}] {key} 失败:\n{res['_error']}",
+                              flush=True)
+                    continue
+
+                got.setdefault(key, []).append(res)
+                if len(got[key]) < args.nstruct:
+                    continue
+
+                row = summarize(by_key[key], got.pop(key), args.trials)
+                w.writerow(row)
+                f.flush()        # 每个突变算完就落盘，中断不丢
+                print(f"[{n}/{len(tasks)}] {key}  "
+                      f"ddG={row['ddG_gam_mean(kcal/mol)']}±{row['ddG_gam_std']} "
+                      f"kcal/mol", flush=True)
+
+    for key, vals in got.items():        # nstruct 没跑满的，有多少写多少
+        print(f'⚠️ {key} 只完成 {len(vals)}/{args.nstruct} 条轨迹')
+
+    print(f'\n总墙钟 {(time.time() - t0) / 3600:.2f} 小时')
+    print('输出:', args.out)
+
+
+if __name__ == '__main__':
+    main()
