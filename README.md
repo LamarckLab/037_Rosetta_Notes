@@ -13,13 +13,13 @@
 
 ## 内容索引
 
-| 文档                                                     | 说明                                                                     |
-| :------------------------------------------------------- | :------------------------------------------------------------------------ |
-| [Rosetta_Setup.md](./Rosetta_Setup.md)                   | conda 环境、依赖与 PyRosetta 安装、验证、工作目录、JupyterLab 启动        |
-| [tutorial/](./tutorial/)                                 | PyRosetta 入门教程 notebook：Pose / ScoreFunction / Mover / ResidueSelector / InterfaceAnalyzer |
-| [Rosetta_Functions.md](./Rosetta_Functions.md)           | 生产用法：批量计算结合能 ΔG / 重复采样 / 多进程并行 / ΔΔG 扫描 |
-| [scripts/](./scripts/)                                   | 生产脚本：批量计算结合能 ΔG，三档流程 + 重复采样与并行                   |
-| [input_data/](./input_data/)                             | 各功能测试用输入文件                                                     |
+| 文档                                           | 说明                                                                                            |
+| :----------------------------------------------- | :------------------------------------------------------------------------------------------------ |
+| [input_data/](./input_data/)                   | 各功能测试用输入文件                                                                            |
+| [tutorial/](./tutorial/)                       | PyRosetta 入门教程 notebook：Pose / ScoreFunction / Mover / ResidueSelector / InterfaceAnalyzer |
+| [scripts/](./scripts/)                         | 生产脚本：批量计算结合能 ΔG，三档流程 + 重复采样与并行                                          |
+| [Rosetta_Setup.md](./Rosetta_Setup.md)         | conda 环境、依赖与 PyRosetta 安装、验证、工作目录、JupyterLab 启动                              |
+| [Rosetta_Functions.md](./Rosetta_Functions.md) | 生产用法：批量计算结合能 ΔG / 重复采样 / 多进程并行 / ΔΔG 扫描                                  |
 
 ---
 
