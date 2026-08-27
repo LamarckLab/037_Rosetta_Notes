@@ -49,17 +49,34 @@ def ddG_from_terms(terms):
     return gam_total, raw_total
 
 
-# 逐状态、逐能量项取分。batches.name 形如 bound_wt_dbreport，structures 关联到 batch
+# InterfaceDdGMover 内部按固定顺序把四个状态交给 db_reporter，batch_id 依次为 1..4。
+# 这个顺序在 C++ 里写死，XML 看不到；下面的 read_db3 会在 batches.name 可用时反查校验。
+BATCH_ORDER = ('bound_wt', 'unbound_wt', 'bound_mut', 'unbound_mut')
+
+# batches 用 LEFT JOIN：它偶尔是空表（结构在、无数据），而能量本身存在
+# structure_scores 里并不受影响。用 INNER JOIN 会让整个查询返回零行。
 _SCORE_SQL = """
-SELECT batches.name, structure_scores.struct_id,
+SELECT structure_scores.batch_id, batches.name, structure_scores.struct_id,
        score_types.score_type_name, structure_scores.score_value
 FROM structure_scores
 INNER JOIN score_types
         ON structure_scores.score_type_id = score_types.score_type_id
        AND structure_scores.batch_id = score_types.batch_id
 INNER JOIN structures ON structures.struct_id = structure_scores.struct_id
-INNER JOIN batches    ON batches.batch_id = structures.batch_id
+LEFT  JOIN batches    ON batches.batch_id = structures.batch_id
 """
+
+
+def state_of(batch_id, batch_name):
+    """定状态：优先用 batches.name，空表时退回 batch_id 顺序"""
+    if batch_name:
+        named = match_state(batch_name)
+        by_id = BATCH_ORDER[batch_id - 1] if 1 <= batch_id <= 4 else None
+        if named and by_id and named != by_id:
+            raise ValueError(f'batch_id {batch_id} 的名字是 {batch_name}，'
+                             f'与假定顺序 {by_id} 不符，BATCH_ORDER 需要更新')
+        return named
+    return BATCH_ORDER[batch_id - 1] if 1 <= batch_id <= 4 else None
 
 
 def read_db3(path):
@@ -70,8 +87,8 @@ def read_db3(path):
     """
     rows = {}
     with sqlite3.connect(path) as conn:
-        for batch_name, struct_id, term, value in conn.execute(_SCORE_SQL):
-            state = match_state(batch_name)
+        for batch_id, batch_name, struct_id, term, value in conn.execute(_SCORE_SQL):
+            state = state_of(batch_id, batch_name)
             if state:
                 rows.setdefault(state, {}).setdefault(struct_id, {})[term] = value
 

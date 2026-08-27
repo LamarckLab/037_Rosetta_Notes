@@ -20,6 +20,7 @@
 | [scripts/](./scripts/)                         | 生产脚本：批量计算结合能 ΔG，三档流程 + 重复采样与并行                                          |
 | [Rosetta_Setup.md](./Rosetta_Setup.md)         | conda 环境、依赖与 PyRosetta 安装、验证、工作目录、JupyterLab 启动                              |
 | [Rosetta_Functions.md](./Rosetta_Functions.md) | 生产用法：批量计算结合能 ΔG / 重复采样 / 多进程并行 / ΔΔG 扫描                                  |
+| [Rosetta_201_server.md](./Rosetta_201_server.md) | 201server 上的即用命令：路径、进程数上限、各档命令、长任务挂后台                                |
 
 ---
 

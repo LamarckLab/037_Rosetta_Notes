@@ -167,7 +167,7 @@ python /data/lmk/rosetta_scripts/batch_dG_repack_relax.py
 python /data/lmk/rosetta_scripts/batch_dG_pipeline.py
 ```
 
-**`dG` 各列取的是 InterfaceAnalyzer 的值**，即 03 CSV 里的 `dG_IA` 那条路，不是 03 的 `dG` 列。IA 是业界通用实现，所以这里不再加 `_IA` 后缀。03 之所以两条路都留，是为了拿到 `E_antibody` / `E_antigen`。
+**`dG` 各列取的是 InterfaceAnalyzer 的值**，即 03 CSV 里的 `dG_IA` 那条路，不是 03 的 `dG` 列。IA 是业界通用实现，所以这里不再加 `_IA` 后缀。之前两条路都留，是为了拿到 `E_antibody` / `E_antigen`。
 
 PyRosetta 每个进程自动取随机种子（`run:constant_seed = False`），同进程内连续调用也在推进 RNG，所以不需要手动管种子。
 
@@ -189,8 +189,123 @@ Rosetta 是**单线程 CPU 密集型**，一个进程占一个核心，进程数
 | `dSASA_int_mean(A^2)`         | 界面埋藏面积的均值                       |
 | `total_time(s)`               | 该结构 `nstruct` 遍加起来的总耗时        |
 
-> **05 ΔΔG 突变扫描 / cartesian_ddG**
+> **05 ΔΔG：突变对结合的影响**
 
-待补充
+ΔG 回答「这个复合物结合得多牢」，ΔΔG 回答「**改一个氨基酸会让它更牢还是更松**」——亲和力成熟要的是后者。
+
+```
+ΔΔG = ΔG_突变体 − ΔG_野生型          ΔΔG < 0 表示突变体结合更强
+```
+
+### 为什么分两级
+
+界面结合 ΔΔG 的领域标准是 **flex ddG**，用 backrub 让主链微动。它准，但贵：
+
+```
+单条轨迹 35000 backrub steps   ≈ 31 分钟
+官方 nstruct = 35              ≈ 18 CPU 小时 / 单个突变
+```
+
+一个界面饱和扫描是 700~800 个突变，用 flex ddG 就是 **32 核跑一个月**。所以拆成两级：
+
+|            | 用什么                       | 速度   | 产出             |
+| :--------- | :--------------------------- | :----- | :--------------- |
+| **第一级** | REF2015 + 只 repack（即 02） | 秒级   | **只是排序**     |
+| **第二级** | 官方 flex ddG（talaris2014） | 小时级 | **可报告的 ΔΔG** |
+
+中间是**人工筛选**：第一级把全部突变排好序输出，删掉不合适的行另存一份，第二级只算留下的。
+
+---
+
+#### 第一级：饱和扫描
+
+```bash
+python /data/lmk/rosetta_scripts/batch_ddG_screen.py
+```
+
+不用准备突变列表。脚本取界面**抗体侧**的残基，每个位点枚举其余 19 种氨基酸。
+
+```
+1. 选界面残基 —— 两侧全要，CB < 10 Å        → repack 范围
+2. 选可突变位点 —— 只要抗体侧               → 突变范围
+3. 算野生型                                  → dG_wt
+4. 逐个突变：MutateResidue → 按 02 的流程算  → dG_mut
+5. ddG_screen = dG_mut − dG_wt
+6. 全部算完后按 ddG_screen 升序重排，补 rank
+```
+
+**突变范围 ≠ repack 范围**：只突变抗体侧，但两侧都 repack。抗原侧虽不突变，但会 repack。
+
+**`dG_wt` 要抽样多次再截尾平均**（默认 20 次去掉两端各 5 个）。
+
+### ⚠️ 这一列为什么叫 `ddG_screen` 而不是 `ddG`
+
+只 repack 没有主链让步的余地，导致已实测的系统性偏差：
+
+```
+S → Y 给出 1405 REU 这种物理上无意义的数
+```
+
+所以它**只能用于排序，不能作为 ΔΔG 报告**。报告值一律来自第二级。
+
+**跑完人工看一眼 top-N 的位点分布**：如果大半挤在同一个位点，就不该整批送第二级 —— 十几个小时全花在一个位点上没有意义。
+
+---
+
+#### 第二级：官方 flex ddG
+
+```bash
+python /data/lmk/rosetta_scripts/batch_ddG_flex.py
+```
+
+筛选后的 csv（`ddG_selected.csv`），跑 Kortemme 实验室的 `ddG-backrub.xml`。该 XML 原样存在 `scripts/` 下，变量替换在内存里做。
+
+```
+1. 按 位置/链/目标氨基酸 生成 resfile
+2. 跑 NSTRUCT 条独立的 backrub 轨迹
+3. 每条轨迹取四个状态的逐项能量
+4. ΔΔG = (bound_mut + unbound_wt) − (bound_wt + unbound_mut)
+5. 过 ZEMu GAM 重加权 → kcal/mol
+6. 对 NSTRUCT 条求均值与标准差
+```
+
+**任务粒度是一条轨迹，不是一个突变。** 按突变切的话每个任务几十小时，进程之间没法均衡。
+
+### GAM 重加权是什么
+
+第 4 步相减得到的是各能量项的 ΔΔG，单位是 REU，直接加起来与实验值对不上。flex ddG 的做法是把 7 个分子间项（`fa_atr`、`fa_rep`、`fa_sol`、`fa_elec` 与三个氢键项）各自过一条拟合好的 S 形曲线再求和 —— 这就是 **GAM**（generalized additive model，广义加性模型），系数由作者在 ZEMu 数据集上拟合。
+
+```
+ddG_mean(kcal/mol)     过了 GAM，标定到 kcal/mol，与实验可比  ← 报告用这个
+ddG_raw_mean(REU)      7 项直接相加，未标定                    ← 只作对照
+```
+
+论文报的 MAE ≈ 1 kcal/mol 是 GAM 之后的值。两列的符号通常一致，差得远说明这个突变落在拟合曲线的非线性区，结果要打折扣看。
+
+### ⚠️ 本档用 talaris2014
+
+flex ddG 整套是在 **talaris2014** 上标定的，与 01–04 不可比。
+
+### 输出 csv 的列
+
+| 列                                  | 含义                                             |
+| :---------------------------------- | :----------------------------------------------- |
+| `pdb_id` / `chain` / `pdb_position` | 突变位置                                         |
+| `wt_aa` / `mut_aa`                  | 原氨基酸 / 目标氨基酸                            |
+| **`ddG_mean(kcal/mol)`**                 | **业界报告值**，GAM 重加权后对 nstruct 求均值    |
+| `ddG_std(kcal/mol)`                      | nstruct 条轨迹之间的标准差                       |
+| `ddG_all(kcal/mol)`                      | 每条轨迹的原始值，分号分隔，换统计口径不必重跑   |
+| `ddG_raw_mean(REU)` / `ddG_raw_std(REU)` | 未经 GAM 重加权的 talaris2014 加和，供对照       |
+| `nstruct_done`                           | 实际完成几条轨迹；为 0 表示该突变一条也没取到数  |
+| `backrub_trials`                    | 每条轨迹的 backrub 步数                          |
+| `cpu_time(s)`                       | 各条轨迹耗时之和，即该突变真实占用的 CPU 时间    |
+
+### 实现要点
+
+**每条轨迹写各自的 db3。** XML 里的 `database_name` 属性会覆盖全局的 `-inout:dbms:database_name`（后者仍须给值，否则 `ReportToDB` 构建时报 inactive option）。**轨迹目录一律保留**，成功失败都不删：每条是 31 分钟 CPU 换来的，删掉就只剩 csv 里的聚合值，想换统计口径或事后排查都得重跑；失败时它更是唯一的现场。单条约 1.6 MB。
+
+**取数与重加权在 `flexddg_lib.py`**，照官方 `analyze_flex_ddG.py` 实现，纯数据处理不依赖 PyRosetta，可以脱离服务器单测。两处可验证的自洽性：双差之后**分子内项全部精确归零**（`fa_dun`、`rama`、`ref` 等与结合无关的项），GAM 与官方公式**逐位一致**。
+
+##### [flex ddG 教程与协议](https://github.com/Kortemme-Lab/flex_ddG_tutorial) &nbsp;|&nbsp; [Barlow et al. JPCB 2018](https://pubs.acs.org/doi/10.1021/acs.jpcb.7b11367)
 
 ##### [PyRosetta API 文档](https://graylab.jhu.edu/PyRosetta.documentation/)

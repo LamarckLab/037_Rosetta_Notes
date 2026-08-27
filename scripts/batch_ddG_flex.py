@@ -10,7 +10,7 @@
 
 符号：ddG < 0 表示突变体结合更强。
 
-参考 https://github.com/Kortemme-Lab/flex_ddG_tutorial
+参考 https://github.com/Kortemm  e-Lab/flex_ddG_tutorial
 """
 
 # ==================== 配置（日常改这里） ====================
@@ -33,7 +33,6 @@ NPROC          = 32       # 最多同时跑几个进程
 import argparse
 import csv
 import os
-import shutil
 import statistics
 import sys
 import time
@@ -45,8 +44,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flexddg_lib import ddG_from_db3
 
 KEYS = ['pdb_id', 'chain', 'pdb_position', 'wt_aa', 'mut_aa']
-FIELDS = KEYS + ['ddG_gam_mean(kcal/mol)', 'ddG_gam_std', 'ddG_raw_mean(REU)',
-                 'ddG_raw_std', 'nstruct_done', 'backrub_trials', 'cpu_time(s)']
+FIELDS = KEYS + ['ddG_mean(kcal/mol)', 'ddG_std(kcal/mol)', 'ddG_all(kcal/mol)',
+                 'ddG_raw_mean(REU)', 'ddG_raw_std(REU)',
+                 'nstruct_done', 'backrub_trials', 'cpu_time(s)']
 
 _XML = None      # 每个 worker 读一次模板
 _POSE = {}       # 每个 worker 缓存已读过的 pdb
@@ -65,7 +65,7 @@ def init_worker(xml_path, work, opts):
     pyrosetta.init(
         '-mute all -corrections::restore_talaris_behavior true '
         '-inout:dbms:mode sqlite3 '
-        f'-inout:dbms:database_name {work}/unused.db3 '
+        f'-inout:dbms:database_name {work}/unused_{os.getpid()}.db3 '
         '-in:file:fullatom -ignore_unrecognized_res '
         '-ignore_zero_occupancy false -ex1 -ex2', silent=True)
     _XML = open(xml_path).read()
@@ -108,12 +108,15 @@ def run_trajectory(task):
         pose = load(pdb_path).clone()
         XmlObjects.create_from_string(xml).get_mover('ParsedProtocol').apply(pose)
         gam, raw, _ = ddG_from_db3(db3)
-        return {'key': tag_of(row), 'gam': gam, 'raw': raw,
-                'sec': time.time() - t0}
+        res = {'key': tag_of(row), 'gam': gam, 'raw': raw,
+               'sec': time.time() - t0}
     except Exception:
-        return {'key': tag_of(row), '_error': traceback.format_exc()}
-    finally:
-        shutil.rmtree(d, ignore_errors=True)     # db3 很占地方，取完数就删
+        return {'key': tag_of(row), '_error': traceback.format_exc(), 'dir': d}
+
+    # 轨迹目录一律保留，成功失败都不删。单条约 1.6 MB，700 条也才 1 GB 出头，
+    # 而每条是 31 分钟 CPU 换来的 —— 删掉就只剩 csv 里的聚合值，想换统计口径
+    # 或事后排查都得重跑。失败时它更是唯一的现场。
+    return res
 
 
 def done_set(out_csv):
@@ -124,20 +127,31 @@ def done_set(out_csv):
 
 
 def summarize(row, vals, trials):
-    """把一个突变的 nstruct 条轨迹汇总成一行"""
+    """把一个突变的若干条轨迹汇总成一行
+
+    vals 为空也要出一行 —— 一个突变一条轨迹都没取到数时（多半是 selected.csv
+    里的位置在 pdb 里不存在），指标列留空、nstruct_done=0，这样输出行数与输入
+    永远对得上，缺哪个一眼可见，不用回头翻日志。
+    """
+    base = {**{k: row[k] for k in KEYS},
+            'nstruct_done': len(vals),
+            'backrub_trials': trials,
+            # 各条轨迹耗时之和，即该突变真实占用的 CPU 时间；并行下墙钟没有可比性
+            'cpu_time(s)': round(sum(v['sec'] for v in vals), 1)}
+    if not vals:
+        return {**base, **{k: '' for k in FIELDS if k.startswith('ddG')}}
+
     gams = [v['gam'] for v in vals]
     raws = [v['raw'] for v in vals]
     two = len(vals) > 1
     return {
-        **{k: row[k] for k in KEYS},
-        'ddG_gam_mean(kcal/mol)': round(statistics.fmean(gams), 3),
-        'ddG_gam_std': round(statistics.stdev(gams), 3) if two else 0.0,
+        **base,
+        'ddG_mean(kcal/mol)': round(statistics.fmean(gams), 3),
+        'ddG_std(kcal/mol)': round(statistics.stdev(gams), 3) if two else 0.0,
+        # 每条轨迹的原始值，留着换统计口径（中位数、截尾均值、看分布）时不用重跑
+        'ddG_all(kcal/mol)': ';'.join(f'{g:.3f}' for g in gams),
         'ddG_raw_mean(REU)': round(statistics.fmean(raws), 3),
-        'ddG_raw_std': round(statistics.stdev(raws), 3) if two else 0.0,
-        'nstruct_done': len(vals),
-        'backrub_trials': trials,
-        # 各条轨迹耗时之和，即这个突变真实占用的 CPU 时间；并行下墙钟没有可比性
-        'cpu_time(s)': round(sum(v['sec'] for v in vals), 1),
+        'ddG_raw_std(REU)': round(statistics.stdev(raws), 3) if two else 0.0,
     }
 
 
@@ -177,7 +191,9 @@ def main():
           f'⚠️ talaris2014 模式，本档结果与 01-04 的 REU 不可比')
 
     t0 = time.time()
-    got, bad = {}, {}
+    got = {}                 # key -> 成功的轨迹结果
+    fails = {}               # key -> [失败次数, 首条 traceback, 现场目录]
+    written = set()          # 已经落盘的突变，收尾时据此补齐剩下的
     new_file = not os.path.exists(args.out)
     ctx = mp.get_context('spawn')
 
@@ -191,10 +207,14 @@ def main():
             for n, res in enumerate(pool.imap_unordered(run_trajectory, tasks), 1):
                 key = res['key']
                 if '_error' in res:
-                    if key not in bad:               # 同一个突变只报一次
-                        bad[key] = True
-                        print(f"[{n}/{len(tasks)}] {key} 失败:\n{res['_error']}",
-                              flush=True)
+                    # 首条打完整 traceback，其余只累计 —— 但计数必须留着，
+                    # 否则「一个突变全灭」在日志上会显示成「偶发一例」
+                    if key not in fails:
+                        fails[key] = [0, res['_error'], res.get('dir', '?')]
+                        print(f"[{n}/{len(tasks)}] {key} 首次失败，"
+                              f"现场保留在 {res.get('dir', '?')}", flush=True)
+                        print(res['_error'], flush=True)
+                    fails[key][0] += 1
                     continue
 
                 got.setdefault(key, []).append(res)
@@ -202,16 +222,28 @@ def main():
                     continue
 
                 row = summarize(by_key[key], got.pop(key), args.trials)
+                written.add(key)
                 w.writerow(row)
                 f.flush()        # 每个突变算完就落盘，中断不丢
                 print(f"[{n}/{len(tasks)}] {key}  "
-                      f"ddG={row['ddG_gam_mean(kcal/mol)']}±{row['ddG_gam_std']} "
+                      f"ddG={row['ddG_mean(kcal/mol)']}±{row['ddG_std(kcal/mol)']} "
                       f"kcal/mol", flush=True)
 
-    for key, vals in got.items():        # nstruct 没跑满的，有多少写多少
-        print(f'⚠️ {key} 只完成 {len(vals)}/{args.nstruct} 条轨迹')
+        # 收尾：凡是还没写过的突变都补一行，包括一条轨迹都没成的。
+        # 输出行数与 selected.csv 永远一致，缺谁按 nstruct_done 排序即可看出
+        for key in sorted(set(by_key) - written):
+            vals = got.get(key, [])
+            row = summarize(by_key[key], vals, args.trials)
+            w.writerow(row)
+            f.flush()
+            print(f"⚠️ {key} 只完成 {len(vals)}/{args.nstruct} 条轨迹  "
+                  f"ddG={row['ddG_mean(kcal/mol)'] or '无'}", flush=True)
 
     print(f'\n总墙钟 {(time.time() - t0) / 3600:.2f} 小时')
+    if fails:
+        print('失败统计（现场目录已保留，可进去查空 db3）:')
+        for key, (cnt, _, d) in sorted(fails.items()):
+            print(f'  {key:<24} {cnt}/{args.nstruct} 条失败    {d}')
     print('输出:', args.out)
 
 
