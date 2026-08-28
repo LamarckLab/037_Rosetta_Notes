@@ -10,8 +10,11 @@ INPUTS    = '/data/lmk/rosetta_inputs'                          # 待评估的�
 OUTPUT    = '/data/lmk/rosetta_outputs/dG_repack_results.csv'    # 指标输出
 INTERFACE = 'HL_A'      # 链分组，要与 pdb 实际链号一致
                         # ⚠️ 左边必须是抗体、右边是抗原，否则 CSV 里两侧的列名会对调
-RADIUS    = 10.0        # 界面判定半径 A（CB 之间的距离），决定 repack 范围
-                        # 与 InterfaceAnalyzer 的默认值一致，改这里会同时改掉 IA 那一侧
+# 两套判据，回答两个不同的问题，详见 interface_lib.py
+SITE_CRIT = 'heavy'     # 报告「真实界面有多大」用的判据 —— 接触问题
+SITE_DIST = 4.0
+PACK_CRIT = 'cb'        # 决定 repack 范围 —— 堆积问题，要给侧链留响应空间
+PACK_DIST = 8.0         # 同时会传给 InterfaceAnalyzer，两条路的 repack 范围才可比
 
 # ===========================================================
 
@@ -21,79 +24,32 @@ import glob
 import os
 import time
 
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import pyrosetta
-from pyrosetta.rosetta.core.pack.task import TaskFactory
-from pyrosetta.rosetta.core.pack.task.operation import (
-    IncludeCurrent, OperateOnResidueSubset, PreventRepackingRLT, RestrictToRepacking)
-from pyrosetta.rosetta.core.pose import append_pose_to_pose
-from pyrosetta.rosetta.core.select import get_residues_from_subset
-from pyrosetta.rosetta.core.select.residue_selector import (
-    AndResidueSelector, ChainSelector, NeighborhoodResidueSelector, NotResidueSelector,
-    OrResidueSelector, ResidueIndexSelector)
 from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
 from pyrosetta.rosetta.protocols.docking import setup_foldtree
-from pyrosetta.rosetta.protocols.minimization_packing import PackRotamersMover
 from pyrosetta.rosetta.utility import vector1_int
 
+from interface_lib import group_pose, interface_both, repack
+
 FIELDS = ['pdb_id', 'residues_num_total', 'residues_num_interface',
-          'residues_num_antibody', 'residues_num_antigen',
+          'residues_num_repack', 'residues_num_antibody', 'residues_num_antigen',
           'E_complex(REU)', 'E_antibody(REU)', 'E_antigen(REU)',
           'dG(REU)', 'dG_IA(REU)', 'dSASA_int(A^2)', 'total_time(s)']
 
 
-def chains_selector(chains):
-    """'HL' -> ChainSelector('H') OR ChainSelector('L')"""
-    sel = ChainSelector(chains[0])
-    for c in chains[1:]:
-        sel = OrResidueSelector(sel, ChainSelector(c))
-    return sel
 
 
-def interface_residues(pose, spec, radius):
-    """界面两侧的残基编号（Rosetta 编号）"""
-    g1, g2 = spec.split('_')
-    s1, s2 = chains_selector(g1), chains_selector(g2)
-    side1 = AndResidueSelector(NeighborhoodResidueSelector(s2, radius, False), s1)
-    side2 = AndResidueSelector(NeighborhoodResidueSelector(s1, radius, False), s2)
-    return sorted(set(get_residues_from_subset(side1.apply(pose))) |
-                  set(get_residues_from_subset(side2.apply(pose))))
-
-
-def group_pose(pose, chains):
-    """把指定链号的残基拼成一个独立的 Pose，同时返回原编号映射"""
-    parts = pose.split_by_chain()
-    info = pose.pdb_info()
-    out, orig = None, []
-    for k in range(1, pose.num_chains() + 1):
-        if info.chain(pose.chain_begin(k)) not in chains:
-            continue
-        orig += list(range(pose.chain_begin(k), pose.chain_end(k) + 1))
-        if out is None:
-            out = parts[k].clone()
-        else:
-            append_pose_to_pose(out, parts[k], True)
-    out.conformation().detect_disulfides()    # 拆开后二硫键记录失效，必须重建
-    return out, orig
-
-
-def repack(pose, scorefxn, subset):
-    """只 repack 指定残基的侧链，其余一律固定"""
-    tf = TaskFactory()
-    tf.push_back(RestrictToRepacking())                 # 不改序列
-    tf.push_back(IncludeCurrent())                      # 把当前构象也纳入候选，否则丢掉 relax 的最小化成果
-    keep = ResidueIndexSelector(','.join(map(str, subset)))
-    tf.push_back(OperateOnResidueSubset(PreventRepackingRLT(), NotResidueSelector(keep)))    # 只放开 subset
-    pack = PackRotamersMover(scorefxn)
-    pack.task_factory(tf)
-    pack.apply(pose)
-
-
-def evaluate(path, spec, radius, scorefxn):
+def evaluate(path, spec, cfg, scorefxn):
     """算一个结构，返回一行指标。并行时每个进程各自 init 并传入自己的 scorefxn"""
     t0 = time.time()
     pose = pyrosetta.pose_from_pdb(path)
 
-    idx = interface_residues(pose, spec, radius)
+    idx = interface_both(pose, spec, cfg['pack_dist'], cfg['pack_crit'])   # repack 范围
+    site = interface_both(pose, spec, cfg['site_dist'], cfg['site_crit'])  # 仅用于报告
     if not idx:
         raise ValueError(f'界面为空，检查链分组 {spec} 是否与该文件匹配')
 
@@ -127,7 +83,8 @@ def evaluate(path, spec, radius, scorefxn):
     return {
         'pdb_id': os.path.basename(path),
         'residues_num_total': pose_ia.total_residue(),
-        'residues_num_interface': len(idx),
+        'residues_num_interface': len(site),     # 重原子判据，真实界面大小
+        'residues_num_repack': len(idx),         # CB 判据，实际放开的侧链
         'residues_num_antibody': pose_ab.total_residue(),
         'residues_num_antigen': pose_ag.total_residue(),
         'E_complex(REU)': round(e_complex, 2),
@@ -153,11 +110,16 @@ def main():
     ap.add_argument('--inputs', default=INPUTS)
     ap.add_argument('--out', default=OUTPUT)
     ap.add_argument('--interface', default=INTERFACE, help='链分组，如 HL_A')
-    ap.add_argument('--radius', type=float, default=RADIUS)
+    ap.add_argument('--site-criterion', default=SITE_CRIT, choices=['cb', 'heavy'])
+    ap.add_argument('--site-dist', type=float, default=SITE_DIST)
+    ap.add_argument('--pack-criterion', default=PACK_CRIT, choices=['cb', 'heavy'])
+    ap.add_argument('--pack-dist', type=float, default=PACK_DIST)
     args = ap.parse_args()
 
-    # 把 IA 的界面判定半径也设成 args.radius，两条路用同一个标准
-    pyrosetta.init(f'-mute all -pose_metrics:interface_cutoff {args.radius}')
+    cfg = {'site_crit': args.site_criterion, 'site_dist': args.site_dist,
+           'pack_crit': args.pack_criterion, 'pack_dist': args.pack_dist}
+    # IA 的 repack 范围也设成同一个值，否则 dG 与 dG_IA 又会因判据不同而分歧
+    pyrosetta.init(f'-mute all -pose_metrics:interface_cutoff {args.pack_dist}')
     scorefxn = pyrosetta.get_fa_scorefxn()
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -165,8 +127,9 @@ def main():
     skip = done_set(args.out)
     todo = [p for p in pdbs if os.path.basename(p) not in skip]
 
-    print(f'界面 {args.interface}  |  共 {len(pdbs)} 个 pdb，'
-          f'已完成 {len(skip)} 个，本次处理 {len(todo)} 个')
+    print(f'界面 {args.interface}  |  位点判据 {cfg["site_crit"]} {cfg["site_dist"]:g} Å'
+          f'  |  repack 判据 {cfg["pack_crit"]} {cfg["pack_dist"]:g} Å  |  '
+          f'共 {len(pdbs)} 个 pdb，已完成 {len(skip)} 个，本次处理 {len(todo)} 个')
 
     new_file = not os.path.exists(args.out)
     with open(args.out, 'a', newline='', encoding='utf-8') as f:
@@ -177,7 +140,7 @@ def main():
         for n, path in enumerate(todo, 1):
             name = os.path.basename(path)
             try:
-                row = evaluate(path, args.interface, args.radius, scorefxn)
+                row = evaluate(path, args.interface, cfg, scorefxn)
                 w.writerow(row)
                 f.flush()        # 每条都落盘，中断不丢已完成的
                 print(f"[{n}/{len(todo)}] {name}  dG={row['dG(REU)']}  "

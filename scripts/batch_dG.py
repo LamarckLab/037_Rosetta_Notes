@@ -10,8 +10,10 @@ INPUTS    = '/data/lmk/rosetta_inputs'                          # 待评估的�
 OUTPUT    = '/data/lmk/rosetta_outputs/dG_results.csv'  # 指标输出
 INTERFACE = 'HL_A'      # 链分组，要与 pdb 实际链号一致
                         # ⚠️ 左边必须是抗体、右边是抗原，否则 CSV 里两侧的列名会对调
-RADIUS    = 10.0        # 界面判定半径 A（CB 之间的距离）
-                        # 01 不 repack，这里只决定 IA 的界面残基集合，即 dSASA 的统计口径
+# 01 不做任何 repack，这两套判据只影响报告列与 IA 的统计口径，详见 interface_lib.py
+SITE_CRIT = 'heavy'     # 报告「真实界面有多大」—— 重原子接触
+SITE_DIST = 4.0
+PACK_DIST = 8.0         # 传给 InterfaceAnalyzer，与 02/03 的 repack 范围口径一致
 
 # ===========================================================
 
@@ -21,40 +23,32 @@ import glob
 import os
 import time
 
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import pyrosetta
-from pyrosetta.rosetta.core.pose import append_pose_to_pose
 from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
 from pyrosetta.rosetta.protocols.docking import setup_foldtree
 from pyrosetta.rosetta.utility import vector1_int
 
-FIELDS = ['pdb_id', 'residues_num_total', 'residues_num_antibody', 'residues_num_antigen',
+from interface_lib import group_pose, interface_both
+
+FIELDS = ['pdb_id', 'residues_num_total', 'residues_num_interface',
+          'residues_num_antibody', 'residues_num_antigen',
           'E_complex(REU)', 'E_antibody(REU)', 'E_antigen(REU)',
           'dG(REU)', 'dG_IA(REU)', 'dSASA_int(A^2)', 'total_time(s)']
 
 
-def group_pose(pose, chains):
-    """把指定链号的残基拼成一个独立的 Pose"""
-    parts = pose.split_by_chain()
-    info = pose.pdb_info()
-    out = None
-    for k in range(1, pose.num_chains() + 1):
-        if info.chain(pose.chain_begin(k)) not in chains:
-            continue
-        if out is None:
-            out = parts[k].clone()
-        else:
-            append_pose_to_pose(out, parts[k], True)
-    out.conformation().detect_disulfides()    # 拆开后二硫键记录失效，必须重建
-    return out
-
-
-def evaluate(path, spec, scorefxn):
+def evaluate(path, spec, cfg, scorefxn):
     """算一个结构，返回一行指标。结构原样使用，不做任何优化"""
     t0 = time.time()
     pose = pyrosetta.pose_from_pdb(path)
 
+    site = interface_both(pose, spec, cfg['site_dist'], cfg['site_crit'])   # 仅用于报告
     g1, g2 = spec.split('_')
-    pose_ab, pose_ag = group_pose(pose, g1), group_pose(pose, g2)    # 直接拆开，不做任何优化
+    pose_ab, _ = group_pose(pose, g1)          # 直接拆开，不做任何优化
+    pose_ag, _ = group_pose(pose, g2)
 
     e_complex = scorefxn(pose)
     e_ab, e_ag = scorefxn(pose_ab), scorefxn(pose_ag)
@@ -73,6 +67,7 @@ def evaluate(path, spec, scorefxn):
     return {
         'pdb_id': os.path.basename(path),
         'residues_num_total': pose.total_residue(),
+        'residues_num_interface': len(site),     # 重原子判据，真实界面大小
         'residues_num_antibody': pose_ab.total_residue(),
         'residues_num_antigen': pose_ag.total_residue(),
         'E_complex(REU)': round(e_complex, 2),
@@ -98,11 +93,14 @@ def main():
     ap.add_argument('--inputs', default=INPUTS)
     ap.add_argument('--out', default=OUTPUT)
     ap.add_argument('--interface', default=INTERFACE, help='链分组，如 HL_A')
-    ap.add_argument('--radius', type=float, default=RADIUS)
+    ap.add_argument('--site-criterion', default=SITE_CRIT, choices=['cb', 'heavy'])
+    ap.add_argument('--site-dist', type=float, default=SITE_DIST)
+    ap.add_argument('--pack-dist', type=float, default=PACK_DIST)
     args = ap.parse_args()
 
-    # 与 02 / 03 保持同一个界面判定半径
-    pyrosetta.init(f'-mute all -pose_metrics:interface_cutoff {args.radius}')
+    cfg = {'site_crit': args.site_criterion, 'site_dist': args.site_dist}
+    # 与 02 / 03 的 repack 判据口径一致，dSASA 才可比
+    pyrosetta.init(f'-mute all -pose_metrics:interface_cutoff {args.pack_dist}')
     scorefxn = pyrosetta.get_fa_scorefxn()
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -122,7 +120,7 @@ def main():
         for n, path in enumerate(todo, 1):
             name = os.path.basename(path)
             try:
-                row = evaluate(path, args.interface, scorefxn)
+                row = evaluate(path, args.interface, cfg, scorefxn)
                 w.writerow(row)
                 f.flush()        # 每条都落盘，中断不丢已完成的
                 print(f"[{n}/{len(todo)}] {name}  dG={row['dG(REU)']}  "

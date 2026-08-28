@@ -18,8 +18,11 @@ INPUTS    = '/data/lmk/rosetta_inputs'                              # 待评估�
 OUTPUT    = '/data/lmk/rosetta_outputs/dG_pipeline_results.csv'     # 指标输出
 INTERFACE = 'HL_A'      # 链分组，要与 pdb 实际链号一致
                         # ⚠️ 左边必须是抗体、右边是抗原，否则 CSV 里两侧的列名会对调
-RADIUS    = 10.0        # 界面判定半径 A（CB 之间的距离），决定 relax 与 repack 范围
-                        # 与 InterfaceAnalyzer 的默认值一致，改这里会同时改掉 IA 那一侧
+# 两套判据，回答两个不同的问题，详见 interface_lib.py
+SITE_CRIT = 'heavy'     # 报告「真实界面有多大」—— 接触问题
+SITE_DIST = 4.0
+PACK_CRIT = 'cb'        # 决定 relax 与 repack 范围 —— 堆积问题
+PACK_DIST = 8.0
 NSTRUCT   = 5           # 每个结构重复几遍
 NPROC     = 32          # 最多同时跑几个进程；实际取 min(NPROC, 待算结构数)
 
@@ -40,17 +43,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from batch_dG_repack_relax import evaluate    # 采样一遍 = 完整跑一遍 03，流程必须一致
 
 FIELDS = ['pdb_id', 'residues_num_total', 'residues_num_interface',
-          'residues_num_antibody', 'residues_num_antigen', 'nstruct',
+          'residues_num_repack', 'residues_num_antibody', 'residues_num_antigen',
+          'nstruct',
           'dG_mean(REU)', 'dG_std(REU)', 'dG_min(REU)', 'dG_max(REU)',
           'dG_all(REU)', 'dSASA_int_mean(A^2)', 'total_time(s)']
 
 _SCOREFXN = None    # 每个 worker 自己的 scorefxn，不能跨进程传
 
 
-def sample(path, spec, radius, scorefxn, nstruct):
+def sample(path, spec, cfg, scorefxn, nstruct):
     """把 03 的 evaluate 跑 nstruct 遍，汇总成一行"""
     t0 = time.time()
-    runs = [evaluate(path, spec, radius, scorefxn) for _ in range(nstruct)]
+    runs = [evaluate(path, spec, cfg, scorefxn) for _ in range(nstruct)]
     dgs = [r['dG_IA(REU)'] for r in runs]    # 取 IA 的值，不用 03 自算的那条
     first = runs[0]
 
@@ -58,6 +62,7 @@ def sample(path, spec, radius, scorefxn, nstruct):
         'pdb_id': first['pdb_id'],
         'residues_num_total': first['residues_num_total'],
         'residues_num_interface': first['residues_num_interface'],
+        'residues_num_repack': first['residues_num_repack'],
         'residues_num_antibody': first['residues_num_antibody'],
         'residues_num_antigen': first['residues_num_antigen'],
         'nstruct': nstruct,
@@ -72,12 +77,12 @@ def sample(path, spec, radius, scorefxn, nstruct):
     }
 
 
-def init_worker(radius):
+def init_worker(pack_dist):
     """每个 worker 起来时跑一次：独立 init，建自己的 scorefxn"""
     global _SCOREFXN
     import pyrosetta
     # silent=True 压掉 PyRosetta 的启动 banner，否则每个 worker 都刷一遍
-    pyrosetta.init(f'-mute all -pose_metrics:interface_cutoff {radius}', silent=True)
+    pyrosetta.init(f'-mute all -pose_metrics:interface_cutoff {pack_dist}', silent=True)
     _SCOREFXN = pyrosetta.get_fa_scorefxn()
     seed = pyrosetta.rosetta.numeric.random.rg().get_seed()
     print(f'  worker pid={os.getpid()}  seed={seed}', flush=True)
@@ -85,9 +90,9 @@ def init_worker(radius):
 
 def work(task):
     """算一个结构。异常不能往外抛，否则整个 pool 会挂；带上 traceback 才好排查"""
-    path, spec, radius, nstruct = task
+    path, spec, cfg, nstruct = task
     try:
-        return sample(path, spec, radius, _SCOREFXN, nstruct)
+        return sample(path, spec, cfg, _SCOREFXN, nstruct)
     except Exception:
         return {'pdb_id': os.path.basename(path), '_error': traceback.format_exc()}
 
@@ -105,7 +110,10 @@ def main():
     ap.add_argument('--inputs', default=INPUTS)
     ap.add_argument('--out', default=OUTPUT)
     ap.add_argument('--interface', default=INTERFACE, help='链分组，如 HL_A')
-    ap.add_argument('--radius', type=float, default=RADIUS)
+    ap.add_argument('--site-criterion', default=SITE_CRIT, choices=['cb', 'heavy'])
+    ap.add_argument('--site-dist', type=float, default=SITE_DIST)
+    ap.add_argument('--pack-criterion', default=PACK_CRIT, choices=['cb', 'heavy'])
+    ap.add_argument('--pack-dist', type=float, default=PACK_DIST)
     ap.add_argument('--nstruct', type=int, default=NSTRUCT, help='每个结构重复几遍')
     ap.add_argument('--nproc', type=int, default=NPROC, help='最多同时跑几个进程')
     args = ap.parse_args()
@@ -122,7 +130,9 @@ def main():
     print(f'界面 {args.interface}  |  每个结构跑 {args.nstruct} 遍  |  {nproc} 进程并行\n'
           f'共 {len(pdbs)} 个 pdb，已完成 {len(skip)} 个，本次处理 {len(todo)} 个')
 
-    tasks = [(p, args.interface, args.radius, args.nstruct) for p in todo]
+    cfg = {'site_crit': args.site_criterion, 'site_dist': args.site_dist,
+           'pack_crit': args.pack_criterion, 'pack_dist': args.pack_dist}
+    tasks = [(p, args.interface, cfg, args.nstruct) for p in todo]
     t0 = time.time()
     new_file = not os.path.exists(args.out)
 
@@ -133,7 +143,8 @@ def main():
         if new_file:
             w.writeheader()
 
-        with ctx.Pool(nproc, initializer=init_worker, initargs=(args.radius,)) as pool:
+        with ctx.Pool(nproc, initializer=init_worker,
+                      initargs=(args.pack_dist,)) as pool:
             for n, row in enumerate(pool.imap_unordered(work, tasks), 1):
                 if '_error' in row:
                     print(f"[{n}/{len(todo)}] {row['pdb_id']}  失败:\n{row['_error']}",

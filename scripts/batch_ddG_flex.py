@@ -22,6 +22,11 @@ XML       = '/data/lmk/rosetta_scripts/ddG-backrub.xml'         # 官方协议�
 WORK      = '/data/lmk/rosetta_work/flexddg'                    # 每条轨迹的临时 db3
 
 MOVE_CHAIN     = 'A'      # 算解离态时把哪条（组）链移开，一般就是抗原
+BUBBLE         = 'cb8'    # backrub 支点与 repack 的邻域判据，围绕突变位点画：
+                          #   cb8    官方原版，邻居原子(CB) 8 Å —— r=0.79 就是它标定的
+                          #   atom4  任意重原子 4 Å；实测两者选出的残基数相当
+                          #          （12~13 vs 13~15），但构成不同
+                          # ⚠️ 改成 atom4 就不再是官方协议，论文的精度数据不适用
 NSTRUCT        = 35       # 每个突变跑几条轨迹；官方推荐 35
 BACKRUB_TRIALS = 35000    # 每条轨迹的 backrub 步数；官方推荐 35000
 MAX_MIN_ITER   = 5000     # 官方 benchmark 值
@@ -48,6 +53,11 @@ FIELDS = KEYS + ['ddG_mean(kcal/mol)', 'ddG_std(kcal/mol)', 'ddG_all(kcal/mol)',
                  'ddG_raw_mean(REU)', 'ddG_raw_std(REU)',
                  'nstruct_done', 'backrub_trials', 'cpu_time(s)']
 
+# 官方 XML 里定义 bubble 的那一行；变体只替换它，磁盘上的文件始终与上游逐字节一致
+BUBBLE_CB8 = '<Neighborhood name="bubble" selector="resselector" distance="8.0"/>'
+BUBBLE_ATOM4 = ('<CloseContact name="bubble" residue_selector="resselector" '
+                'contact_threshold="4.0"/>')
+
 _XML = None      # 每个 worker 读一次模板
 _POSE = {}       # 每个 worker 缓存已读过的 pdb
 
@@ -70,7 +80,7 @@ def locate(pose, chain, num, icode):
     return None
 
 
-def init_worker(xml_path, work, opts):
+def init_worker(xml_path, work, opts, bubble):
     """每个 worker 起来时跑一次。注意这里进的是 talaris 模式，全局生效"""
     global _XML
     import pyrosetta
@@ -83,6 +93,9 @@ def init_worker(xml_path, work, opts):
         '-in:file:fullatom -ignore_unrecognized_res '
         '-ignore_zero_occupancy false -ex1 -ex2', silent=True)
     _XML = open(xml_path).read()
+    if bubble == 'atom4':
+        assert BUBBLE_CB8 in _XML, 'XML 里找不到官方那行 Neighborhood，无法替换'
+        _XML = _XML.replace(BUBBLE_CB8, BUBBLE_ATOM4)
 
 
 def load(path):
@@ -193,6 +206,8 @@ def main():
     ap.add_argument('--xml', default=XML)
     ap.add_argument('--work', default=WORK)
     ap.add_argument('--move-chain', default=MOVE_CHAIN, help='解离时移开哪条链')
+    ap.add_argument('--bubble', default=BUBBLE, choices=['cb8', 'atom4'],
+                    help='突变位点邻域判据；cb8 为官方原版')
     ap.add_argument('--nstruct', type=int, default=NSTRUCT)
     ap.add_argument('--trials', type=int, default=BACKRUB_TRIALS)
     ap.add_argument('--nproc', type=int, default=NPROC)
@@ -217,7 +232,7 @@ def main():
     by_key = {tag_of(r): r for r in rows}
 
     print(f'{len(rows)} 个突变 × {args.nstruct} 条轨迹 = {len(tasks)} 个任务  |  '
-          f'{args.trials} backrub steps  |  {args.nproc} 进程\n'
+          f'{args.trials} backrub steps  |  bubble {args.bubble}  |  {args.nproc} 进程\n'
           f'⚠️ talaris2014 模式，本档结果与 01-04 的 REU 不可比')
 
     t0 = time.time()
@@ -233,7 +248,7 @@ def main():
             w.writeheader()
 
         with ctx.Pool(args.nproc, initializer=init_worker,
-                      initargs=(args.xml, args.work, opts)) as pool:
+                      initargs=(args.xml, args.work, opts, args.bubble)) as pool:
             for n, res in enumerate(pool.imap_unordered(run_trajectory, tasks), 1):
                 key = res['key']
                 if '_error' in res:

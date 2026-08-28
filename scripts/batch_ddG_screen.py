@@ -17,7 +17,15 @@ INPUTS    = '/data/lmk/rosetta_inputs'                          # 待扫描的�
 OUTPUT    = '/data/lmk/rosetta_outputs/ddG_screen_results.csv'  # 指标输出
 INTERFACE = 'HL_A'      # 链分组，要与 pdb 实际链号一致
                         # ⚠️ 左边必须是抗体、右边是抗原
-RADIUS    = 10.0        # 界面判定半径 A（CB 之间的距离）
+# 判据分两套，因为它们回答的是两个不同的问题
+#   cb    邻居原子（标准氨基酸即 CB，甘氨酸 CA）之间的距离
+#   heavy 重原子之间的距离，不含氢
+SITE_CRIT = 'heavy'     # 挑「值得突变的位点」—— 接触问题
+SITE_DIST = 4.0         # 重原子 4 Å 是结构生物学判定界面接触的通行口径
+PACK_CRIT = 'cb'        # 定「repack 范围」—— 堆积问题，要给侧链留响应空间
+PACK_DIST = 8.0         # 尺度沿用官方 flex ddG 的 bubble（CB 8 Å）
+                        # ⚠️ 判据与距离必须一起改，两者不可换算：同一结构抗原侧
+                        #    cb 4 Å 只选出 1 个残基，而 cb 10 Å 是 23 个
 MUT_SIDE  = 'antibody'  # 突变哪一侧：antibody（下划线左边）或 antigen
 WT_NREPEAT= 20          # 野生型参考值重复几次
 WT_TRIM   = 5           # 排序后掐掉最负的 N 个和最正的 N 个，用中间的求均值
@@ -39,7 +47,7 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from batch_dG_repack import (chains_selector, group_pose, interface_residues, repack)
+from interface_lib import dG_from_pose, interface_both, one_side
 
 AA3 = {'A': 'ALA', 'C': 'CYS', 'D': 'ASP', 'E': 'GLU', 'F': 'PHE',
        'G': 'GLY', 'H': 'HIS', 'I': 'ILE', 'K': 'LYS', 'L': 'LEU',
@@ -53,36 +61,6 @@ _SCOREFXN = None    # 每个 worker 自己的 scorefxn，不能跨进程传
 _POSE = {}          # 每个 worker 缓存已读过的 pdb，避免每个突变都重读
 
 
-def mutate_side(pose, spec, radius, side):
-    """要突变的那一侧的界面残基编号（Rosetta 编号）"""
-    from pyrosetta.rosetta.core.select import get_residues_from_subset
-    from pyrosetta.rosetta.core.select.residue_selector import (
-        AndResidueSelector, NeighborhoodResidueSelector)
-
-    g1, g2 = spec.split('_')
-    mine, other = (g1, g2) if side == 'antibody' else (g2, g1)
-    sel = AndResidueSelector(
-        NeighborhoodResidueSelector(chains_selector(other), radius, False),
-        chains_selector(mine))
-    return sorted(get_residues_from_subset(sel.apply(pose)))
-
-
-def dG_from_pose(pose, spec, idx, scorefxn):
-    """02 的流程，但入参是内存里的 Pose 而不是文件路径"""
-    repack(pose, scorefxn, idx)                  # 结合态 repack
-    e_complex = scorefxn(pose)
-
-    g1, g2 = spec.split('_')
-    iface = set(idx)
-    pose_ab, orig_ab = group_pose(pose, g1)      # 拆开
-    pose_ag, orig_ag = group_pose(pose, g2)
-    repack(pose_ab, scorefxn,
-           [j for j, o in enumerate(orig_ab, 1) if o in iface])
-    repack(pose_ag, scorefxn,
-           [j for j, o in enumerate(orig_ag, 1) if o in iface])
-    return e_complex - scorefxn(pose_ab) - scorefxn(pose_ag)
-
-
 def load(path):
     """读 pdb 并缓存；同一个 worker 处理同一结构的上百个突变，只读一次"""
     import pyrosetta
@@ -91,11 +69,15 @@ def load(path):
     return _POSE[path]
 
 
-def wt_setup(path, spec, radius, side):
-    """界面残基与待突变位点清单，不算能量"""
+def wt_setup(path, spec, cfg, side):
+    """界面残基与待突变位点清单，不算能量
+
+    repack 范围与突变位点用**两套判据**：前者是堆积问题要放宽，后者是接触问题要收紧。
+    repack 范围对 dG_wt 与全部 dG_mut 共用，否则相减时会混进「范围不同」的偏差。
+    """
     pose = load(path)
-    idx = interface_residues(pose, spec, radius)         # repack 范围：界面两侧
-    sites = mutate_side(pose, spec, radius, side)        # 突变范围：只一侧
+    idx = interface_both(pose, spec, cfg['pack_dist'], cfg['pack_crit'])
+    sites = one_side(pose, spec, cfg['site_dist'], cfg['site_crit'], side)
     if not sites:
         raise ValueError(f'界面为空，检查链分组 {spec} 与 MUT_SIDE={side}')
 
@@ -121,11 +103,12 @@ def trimmed(vals, trim):
     return round(statistics.fmean(kept), 2), kept
 
 
-def init_worker(radius):
+def init_worker():
     """每个 worker 起来时跑一次：独立 init，建自己的 scorefxn"""
     global _SCOREFXN
     import pyrosetta
-    pyrosetta.init(f'-mute all -pose_metrics:interface_cutoff {radius}', silent=True)
+    # 本档不用 InterfaceAnalyzer，判据由脚本自己的 site/pack 两套参数决定
+    pyrosetta.init('-mute all', silent=True)
     _SCOREFXN = pyrosetta.get_fa_scorefxn()
 
 
@@ -183,7 +166,12 @@ def main():
     ap.add_argument('--inputs', default=INPUTS)
     ap.add_argument('--out', default=OUTPUT)
     ap.add_argument('--interface', default=INTERFACE, help='链分组，如 HL_A')
-    ap.add_argument('--radius', type=float, default=RADIUS)
+    ap.add_argument('--site-criterion', default=SITE_CRIT, choices=['cb', 'heavy'])
+    ap.add_argument('--site-dist', type=float, default=SITE_DIST,
+                    help='挑突变位点的距离 A')
+    ap.add_argument('--pack-criterion', default=PACK_CRIT, choices=['cb', 'heavy'])
+    ap.add_argument('--pack-dist', type=float, default=PACK_DIST,
+                    help='repack 范围的距离 A')
     ap.add_argument('--side', default=MUT_SIDE, choices=['antibody', 'antigen'])
     ap.add_argument('--wt-nrepeat', type=int, default=WT_NREPEAT)
     ap.add_argument('--wt-trim', type=int, default=WT_TRIM)
@@ -193,7 +181,11 @@ def main():
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     pdbs = sorted(glob.glob(os.path.join(args.inputs, '*.pdb')))
     skip = done_set(args.out)
+    cfg = {'site_crit': args.site_criterion, 'site_dist': args.site_dist,
+           'pack_crit': args.pack_criterion, 'pack_dist': args.pack_dist}
     print(f'界面 {args.interface}  |  突变 {args.side} 侧  |  '
+          f'位点判据 {cfg["site_crit"]} {cfg["site_dist"]:g} Å  |  '
+          f'repack 判据 {cfg["pack_crit"]} {cfg["pack_dist"]:g} Å  |  '
           f'{args.nproc} 进程  |  {len(pdbs)} 个 pdb，已完成 {len(skip)} 个突变')
 
     t0 = time.time()
@@ -205,12 +197,10 @@ def main():
         if new_file:
             w.writeheader()
 
-        with ctx.Pool(args.nproc, initializer=init_worker,
-                      initargs=(args.radius,)) as pool:
+        with ctx.Pool(args.nproc, initializer=init_worker) as pool:
             for path in pdbs:
                 name = os.path.basename(path)
-                ref = pool.apply(wt_setup,
-                                 (path, args.interface, args.radius, args.side))
+                ref = pool.apply(wt_setup, (path, args.interface, cfg, args.side))
 
                 # 野生型锚定全部突变，多抽几次截尾平均，免得被一次坏解整体平移
                 draws = pool.map(wt_energy,
