@@ -46,7 +46,7 @@ AA3 = {'A': 'ALA', 'C': 'CYS', 'D': 'ASP', 'E': 'GLU', 'F': 'PHE',
        'M': 'MET', 'N': 'ASN', 'P': 'PRO', 'Q': 'GLN', 'R': 'ARG',
        'S': 'SER', 'T': 'THR', 'V': 'VAL', 'W': 'TRP', 'Y': 'TYR'}
 
-FIELDS = ['pdb_id', 'chain', 'pdb_position', 'wt_aa', 'mut_aa',
+FIELDS = ['pdb_id', 'chain', 'pdb_position', 'icode', 'wt_aa', 'mut_aa',
           'dG_wt(REU)', 'dG_mut(REU)', 'ddG_screen(REU)', 'rank']
 
 _SCOREFXN = None    # 每个 worker 自己的 scorefxn，不能跨进程传
@@ -102,8 +102,9 @@ def wt_setup(path, spec, radius, side):
     info = pose.pdb_info()
     return {
         'repack_idx': idx,
-        'sites': [(p, info.chain(p), info.number(p), pose.residue(p).name1())
-                  for p in sites],
+        # icode 必须带上：H100 与 H100A 是两个不同的残基，只记 number 会重名
+        'sites': [(p, info.chain(p), info.number(p), info.icode(p).strip(),
+                   pose.residue(p).name1()) for p in sites],
     }
 
 
@@ -130,7 +131,7 @@ def init_worker(radius):
 
 def work(task):
     """算一个突变。异常不能往外抛，否则整个 pool 会挂"""
-    path, spec, pos, chain, num, wt_aa, mut_aa, idx, dG_wt = task
+    path, spec, pos, chain, num, icode, wt_aa, mut_aa, idx, dG_wt = task
     try:
         from pyrosetta.rosetta.protocols.simple_moves import MutateResidue
         pose = load(path).clone()
@@ -138,7 +139,7 @@ def work(task):
         dG_mut = dG_from_pose(pose, spec, idx, _SCOREFXN)
         return {
             'pdb_id': os.path.basename(path),
-            'chain': chain, 'pdb_position': num,
+            'chain': chain, 'pdb_position': num, 'icode': icode,
             'wt_aa': wt_aa, 'mut_aa': mut_aa,
             'dG_wt(REU)': dG_wt,
             'dG_mut(REU)': round(dG_mut, 2),
@@ -147,12 +148,13 @@ def work(task):
         }
     except Exception:
         return {'pdb_id': os.path.basename(path),
-                '_error': f'{chain}{num}{wt_aa}->{mut_aa}\n{traceback.format_exc()}'}
+                '_error': f'{chain}{num}{icode}{wt_aa}->{mut_aa}\n{traceback.format_exc()}'}
 
 
 def key(row):
     """断点续跑用的唯一键"""
-    return f"{row['pdb_id']}:{row['chain']}{row['pdb_position']}{row['mut_aa']}"
+    return (f"{row['pdb_id']}:{row['chain']}{row['pdb_position']}"
+            f"{row.get('icode', '')}{row['mut_aa']}")
 
 
 def done_set(out_csv):
@@ -220,12 +222,12 @@ def main():
                       f'[{min(draws):.2f}, {max(draws):.2f}] -> 保留 {len(kept)} 个 '
                       f'[{min(kept):.2f}, {max(kept):.2f}]')
 
-                tasks = [(path, args.interface, pos, ch, num, wt, mut,
+                tasks = [(path, args.interface, pos, ch, num, ic, wt, mut,
                           ref['repack_idx'], dG_wt)
-                         for pos, ch, num, wt in ref['sites']
+                         for pos, ch, num, ic, wt in ref['sites']
                          for mut in AA3 if mut != wt]
                 tasks = [t for t in tasks
-                         if f'{name}:{t[3]}{t[4]}{t[6]}' not in skip]
+                         if f'{name}:{t[3]}{t[4]}{t[5]}{t[7]}' not in skip]
                 print(f'{len(ref["sites"])} 个位点，{len(tasks)} 个待算突变')
                 if not tasks:
                     continue
@@ -244,7 +246,8 @@ def main():
     print('输出:', args.out)
     print('\n--- ddG_screen 最负的 10 个（仅供排序，不是 ΔΔG 报告值）---')
     for r in rows[:10]:
-        print(f"  {r['pdb_id']:<16} {r['chain']}{r['pdb_position']:<5} "
+        print(f"  {r['pdb_id']:<16} "
+              f"{r['chain']}{r['pdb_position']}{r['icode']:<5} "
               f"{r['wt_aa']} -> {r['mut_aa']}   {r['ddG_screen(REU)']:>8}")
 
 

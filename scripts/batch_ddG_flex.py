@@ -43,7 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from flexddg_lib import ddG_from_db3
 
-KEYS = ['pdb_id', 'chain', 'pdb_position', 'wt_aa', 'mut_aa']
+KEYS = ['pdb_id', 'chain', 'pdb_position', 'icode', 'wt_aa', 'mut_aa']
 FIELDS = KEYS + ['ddG_mean(kcal/mol)', 'ddG_std(kcal/mol)', 'ddG_all(kcal/mol)',
                  'ddG_raw_mean(REU)', 'ddG_raw_std(REU)',
                  'nstruct_done', 'backrub_trials', 'cpu_time(s)']
@@ -53,7 +53,21 @@ _POSE = {}       # 每个 worker 缓存已读过的 pdb
 
 
 def tag_of(row):
-    return f"{row['pdb_id']}:{row['chain']}{row['pdb_position']}{row['mut_aa']}"
+    return (f"{row['pdb_id']}:{row['chain']}{row['pdb_position']}"
+            f"{row.get('icode', '')}{row['mut_aa']}")
+
+
+def locate(pose, chain, num, icode):
+    """按 链+编号+插入编号 找 Rosetta 内部编号
+
+    抗体 Kabat 编号里 H100 与 H100A 是两个不同的残基，只按 number 定位会张冠李戴。
+    """
+    info = pose.pdb_info()
+    for i in range(1, pose.total_residue() + 1):
+        if (info.chain(i) == chain and info.number(i) == int(num)
+                and info.icode(i).strip() == (icode or '').strip()):
+            return i
+    return None
 
 
 def init_worker(xml_path, work, opts):
@@ -89,9 +103,26 @@ def run_trajectory(task):
     try:
         os.makedirs(d, exist_ok=True)
         resfile = os.path.join(d, 'mutate.resfile')
-        with open(resfile, 'w') as f:                       # 官方 resfile 格式
-            f.write(f"NATAA\nstart\n{row['pdb_position']} {row['chain']} "
-                    f"PIKAA {row['mut_aa']}\n")
+        # 动手前先核对：csv 说这里是 wt_aa，结构里也必须真的是它。编号体系对不上时
+        # （插入编号丢失、换了 pdb 版本、手工改错 csv），这里当场报错，而不是安静地
+        # 算出一个张冠李戴的 ΔΔG
+        pose = load(pdb_path).clone()
+        icode = (row.get('icode') or '').strip()
+        target = locate(pose, row['chain'], row['pdb_position'], icode)
+        if target is None:
+            raise ValueError(
+                f"结构里找不到 {row['chain']}{row['pdb_position']}{icode}")
+        actual = pose.residue(target).name1()
+        if actual != row['wt_aa']:
+            raise ValueError(
+                f"{row['chain']}{row['pdb_position']}{icode} 实际是 {actual}，"
+                f"csv 写的是 {row['wt_aa']} —— 编号对不上，拒绝计算")
+
+        # 官方 resfile 格式；插入编号直接跟在数字后面无空格（已实测 100A 能精确命中）
+        mut_line = (f"{row['pdb_position']}{icode} {row['chain']} "
+                    f"PIKAA {row['mut_aa']}")
+        with open(resfile, 'w') as f:
+            f.write(chr(10).join(['NATAA', 'start', mut_line, '']))
 
         db3 = os.path.join(d, 'ddG.db3')
         xml = (_XML.replace('database_name="ddG.db3"', f'database_name="{db3}"')
@@ -105,7 +136,6 @@ def run_trajectory(task):
                          'abs_score_convergence_thresh': str(opts['conv'])}.items():
             xml = xml.replace(f'%%{key}%%', val)
 
-        pose = load(pdb_path).clone()
         XmlObjects.create_from_string(xml).get_mover('ParsedProtocol').apply(pose)
         gam, raw, _ = ddG_from_db3(db3)
         res = {'key': tag_of(row), 'gam': gam, 'raw': raw,
