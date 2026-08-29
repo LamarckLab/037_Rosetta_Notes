@@ -17,10 +17,14 @@ conda activate lmk_Rosetta
 
 *并行线程*
 ```bash
---nproc 32      # 常规值；机子空闲时最多开到 64，留余量给同机其他人
+--nproc 48      # 本机默认值
 ```
 
-⚠️ **本机 `nproc` 返回 176，但实际只有 82 个在线核心**。另外本机 **swap 为 0**，内存打满是直接 OOM 杀进程，没有变慢作为预警。
+⚠️ **本机 `nproc` 返回 176，但实际只有 82 个在线核心**（`cat /sys/devices/system/cpu/online` → `0-81`）。照 176 开进程会严重超订，48 是在 82 上留了余量。
+
+⚠️ 本机常有别的任务在跑，开跑前 `uptime` 看一眼负载 —— 已有负载加上 48 个进程超过 82 就会互相拖慢。
+
+⚠️ 本机 **swap 为 0**，内存打满是直接 OOM 杀进程，没有变慢作为预警。
 
 ---
 
@@ -69,7 +73,7 @@ python /home/limingkai/rosetta_scripts/batch_dG_pipeline.py \
   --out /home/limingkai/rosetta_outputs/dG_pipeline_results.csv \
   --interface HL_A \
   --nstruct 5 \
-  --nproc 32
+  --nproc 48
 ```
 
 > **05 ΔΔG 抗体侧饱和突变**
@@ -81,13 +85,13 @@ python /home/limingkai/rosetta_scripts/batch_ddG_screen_antibody.py \
   --inputs /home/limingkai/rosetta_inputs \
   --out /home/limingkai/rosetta_outputs/ddG_screen_antibody_results.csv \
   --interface HL_A \
-  --nproc 32
+  --nproc 48
 ```
 
 跑完人工筛选，删掉不合适的行，另存为 `/home/limingkai/rosetta_outputs/ddG_selected_antibody.csv`，再进第二级：
 
 ```bash
-python /home/limingkai/rosetta_scripts/batch_ddG_flex_antibody.py \
+nohup python /home/limingkai/rosetta_scripts/batch_ddG_flex_antibody.py \
   --selected /home/limingkai/rosetta_outputs/ddG_selected_antibody.csv \
   --pdb-dir /home/limingkai/rosetta_inputs \
   --out /home/limingkai/rosetta_outputs/ddG_flex_antibody_results.csv \
@@ -95,10 +99,13 @@ python /home/limingkai/rosetta_scripts/batch_ddG_flex_antibody.py \
   --work /home/limingkai/rosetta_work/flexddg \
   --move-chain A \
   --nstruct 35 \
-  --nproc 32
+  --nproc 48 \
+  > /home/limingkai/rosetta_outputs/ddG_flex_antibody.log 2>&1 &
 ```
 
-`--work` 目录脚本自己建，每条轨迹一个子目录，**成功失败都保留**（单条约 1.6 MB，一次跑几百条也就 1 GB 出头）。官方 nstruct=35 时单个突变约 18 CPU 小时，务必挂后台跑。
+**第二级一律挂后台。** 201 走公网，SSH 一断前台任务就没了，而官方 `nstruct=35` 下单个突变约 18 CPU 小时，一批下来几小时到几天。第一级只要几十秒，前台跑即可。
+
+`--work` 目录脚本自己建，每条轨迹一个子目录，**成功失败都保留**（单条约 1.6 MB，一次跑几百条也就 1 GB 出头）。
 
 > **06 ΔΔG 抗原侧饱和突变**
 
@@ -109,13 +116,13 @@ python /home/limingkai/rosetta_scripts/batch_ddG_screen_antigen.py \
   --inputs /home/limingkai/rosetta_inputs \
   --out /home/limingkai/rosetta_outputs/ddG_screen_antigen_results.csv \
   --interface HL_A \
-  --nproc 32
+  --nproc 48
 ```
 
 人工筛选后另存为 `ddG_selected_antigen.csv`，再跑第二级：
 
 ```bash
-python /home/limingkai/rosetta_scripts/batch_ddG_flex_antigen.py \
+nohup python /home/limingkai/rosetta_scripts/batch_ddG_flex_antigen.py \
   --selected /home/limingkai/rosetta_outputs/ddG_selected_antigen.csv \
   --pdb-dir /home/limingkai/rosetta_inputs \
   --out /home/limingkai/rosetta_outputs/ddG_flex_antigen_results.csv \
@@ -123,29 +130,23 @@ python /home/limingkai/rosetta_scripts/batch_ddG_flex_antigen.py \
   --work /home/limingkai/rosetta_work/flexddg \
   --move-chain A \
   --nstruct 35 \
-  --nproc 32
+  --nproc 48 \
+  > /home/limingkai/rosetta_outputs/ddG_flex_antigen.log 2>&1 &
 ```
 
 两侧的输出文件名都带侧别，**同时跑不会互相覆盖**；`--work` 可以共用，每条轨迹的子目录名里带了突变标识。
 
-> **07 长任务挂后台**
-
-201 是走公网的远程机子，SSH 一断前台任务就没了。04 与 05/06 的第二级动辄几小时到几天，一律挂后台：
+> **07 看后台任务的进度**
 
 ```bash
-nohup python /home/limingkai/rosetta_scripts/batch_ddG_flex_antibody.py \
-  --selected /home/limingkai/rosetta_outputs/ddG_selected_antibody.csv \
-  --pdb-dir /home/limingkai/rosetta_inputs \
-  --out /home/limingkai/rosetta_outputs/ddG_flex_antibody_results.csv \
-  --xml /home/limingkai/rosetta_scripts/ddG-backrub.xml \
-  --work /home/limingkai/rosetta_work/flexddg \
-  --nproc 32 \
-  > /home/limingkai/rosetta_outputs/ddG_flex_antibody.log 2>&1 &
+tail -f /home/limingkai/rosetta_outputs/ddG_flex_antibody.log     # 抗体侧
+tail -f /home/limingkai/rosetta_outputs/ddG_flex_antigen.log      # 抗原侧
+
+pgrep -af batch_ddG_flex        # 还在不在跑；两侧同时跑时会各列一行
 ```
 
-```bash
-tail -f /home/limingkai/rosetta_outputs/ddG_flex_antibody.log      # 看进度
-pgrep -af batch_ddG_flex                                  # 确认还在跑
-```
+日志里每算完**一个突变**（即它的 `nstruct` 条轨迹全部收满）打一行。所以官方参数下头几个小时可能一行都没有，属正常 —— 想确认它在动，看 `--work` 目录下的子目录数量涨没涨。
+
+`nohup` 起的进程与 SSH 会话脱钩，断线不影响；重连之后用上面的命令继续看。中途真的中断了也不必从头来，两级都支持断点续跑。
 
 ##### [Rosetta_Functions.md](./Rosetta_Functions.md) &nbsp;|&nbsp; [Rosetta_Setup.md](./Rosetta_Setup.md)
