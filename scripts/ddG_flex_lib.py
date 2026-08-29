@@ -1,4 +1,7 @@
-"""第二级：对筛选后的突变跑官方 flex ddG，产出可报告的 ΔΔG。
+"""第二级的实现：对筛选后的突变跑官方 flex ddG，产出可报告的 ΔΔG。
+
+不直接跑，由 batch_ddG_flex_antibody.py / _antigen.py 两个入口调用，它们只覆盖
+默认的输入输出路径。
 
 读第一级输出（人工筛过的）csv，逐个突变按 Kortemme 实验室的 ddG-backrub.xml
 跑 NSTRUCT 条 backrub 轨迹，取数与重加权照官方 analyze_flex_ddG.py。

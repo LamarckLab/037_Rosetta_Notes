@@ -1,6 +1,6 @@
 """06 第二级：对抗原侧突变跑官方 flex ddG。
 
-跟 05 的 batch_ddG_flex.py 是同一套逻辑，只换默认的输入输出路径，跑的时候不必
+跟 05 共用 ddG_flex_lib.py 里的同一套逻辑，只换默认的输入输出路径，跑的时候不必
 带参数。协议本身完全相同 —— flex ddG 按 resfile 定位残基，不关心突变落在抗体
 还是抗原，bubble 仍是官方原版的邻居原子 8 Å。
 
@@ -13,7 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import batch_ddG_flex as base
+import ddG_flex_lib as base
 
 base.SELECTED = '/data/lmk/rosetta_outputs/ddG_selected_antigen.csv'
 base.OUTPUT = '/data/lmk/rosetta_outputs/ddG_flex_antigen_results.csv'

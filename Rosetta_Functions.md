@@ -18,7 +18,7 @@ conda activate lmk_Rosetta
 
 **CSV 里有两列 ΔG，算的是同一个量，走的是两条独立的路**：
 
-| 列            | 怎么来的                                                         |
+| 列            | 计算方式                                                         |
 | :------------ | :--------------------------------------------------------------- |
 | **`dG(REU)`** | 脚本自己算：把 Pose **真拆成两个**，可以拿到抗原和抗体各自的能量 |
 | `dG_IA(REU)`  | InterfaceAnalyzerMover 算的：沿 jump 把一组链**平移**到远处      |
@@ -39,28 +39,15 @@ dG = E_complex − E_antibody − E_antigen
 
 ### 界面判据：两套，回答两个不同的问题
 
-| | 判据 | 距离 | 量谁和谁 | 依据 |
-| :--- | :--- | ---: | :--- | :--- |
-| **位点** | 重原子 | **4 Å** | 抗体组 ↔ 抗原组 | 结构生物学判定界面接触的通行口径 |
-| **repack** | 邻居原子(CB) | **8 Å** | 抗体组 ↔ 抗原组 | 沿用官方 flex ddG 的尺度 |
-| **bubble**（仅 05/06 第二级） | 邻居原子(CB) | **8 Å** | 突变位点 ↔ 周围 | 官方 flex ddG 原版，未改 |
+|                               | 判据   |    距离 | 测量对象        | 依据                             |
+| :---------------------------- | :----- | ------: | :-------------- | :------------------------------- |
+| **界面位点**                  | 重原子 | **4 Å** | 抗体组 ↔ 抗原组 | 结构生物学判定界面接触的通行口径 |
+| **repack**                    | β 碳   | **8 Å** | 抗体组 ↔ 抗原组 | 沿用官方 flex ddG 的尺度         |
+| **bubble**（仅 05/06 第二级） | β 碳   | **8 Å** | 突变位点 ↔ 周围 | 官方 flex ddG 原版，未改         |
 
-**位点判据**回答「哪些残基真的在界面上」——这是接触问题，重原子 4 Å 是通行做法。01–04 用它填 `residues_num_interface` 这一列，05/06 用它决定枚举哪些位点做饱和突变。
+**界面位点判据**回答「哪些残基真的在界面上」。01–04 用它填 `residues_num_interface` 这一列，05/06 用它决定枚举哪些位点做饱和突变。
 
-**repack 判据**回答「算能量时放开哪些侧链去松弛」——这是堆积问题，判据要放宽，宁可多放几个也别漏掉能响应的侧链。它同时传给 InterfaceAnalyzer 的 `-pose_metrics:interface_cutoff`，否则 `dG` 与 `dG_IA` 会因判据不同而分歧。
-
-⚠️ **两个数值不可换算，换判据必须同时换距离。** 同一结构的抗原侧实测：
-
-```
-邻居原子  4 Å  →   1 个残基      两个 CB 相距 4 Å 意味着主链快重叠了
-邻居原子  8 Å  →  15 个
-重原子    4 Å  →  18 个
-邻居原子 10 Å  →  23 个
-```
-
-⚠️ **Rosetta 自带的 `CloseContactResidueSelector` 把氢也算进去**，实测同一结构 4 Å 下它给 32 个、重原子口径只有 23 个，差 39%。所以重原子判据在 `interface_lib.py` 里自己实现，不用那个选择器。
-
-（历史：早先全仓库统一用 CB 10 Å，那是 InterfaceAnalyzer 的默认值。但 10 Å 从来就不是「界面残基」的判据 —— 它是 IA 用来决定 repack 范围的，被借来当界面定义了。现在两个问题分开各用各的判据。）
+**repack 判据**回答「算能量时放开哪些侧链去松弛」，判据要放宽，宁可多放几个也别漏掉能响应的侧链。
 
 ---
 
@@ -125,16 +112,12 @@ python /data/lmk/rosetta_scripts/batch_dG_repack.py
 | 步骤            | `dG`（脚本自算）                       | `dG_IA`（InterfaceAnalyzer）         |
 | :-------------- | :------------------------------------- | :----------------------------------- |
 | 起点            | 原始 pose                              | 同一个 pose 的 clone（**起点相同**） |
-| repack 哪些残基 | CB 8 Å 选出的那批                      | CB 8 Å 选出的同一批                  |
+| repack 哪些残基 | 界面位点 CB 8 Å 选出的那批             | 界面位点 CB 8 Å 选出的同一批         |
 | 结合态          | repack 那批 → 打分                     | `pack_input=True` 自己 repack → 打分 |
 | **怎么分开**    | **`split_by_chain()` 真拆成两个 Pose** | **沿 jump 平移到远处**               |
 | 分离态          | 两个子 Pose 各 repack 同一批 → 打分    | `pack_separated=True` 再 repack      |
 
-界面判据对齐之后，两条路的差异只剩**分开方式**：脚本真拆成两个 Pose，IA 沿 jump 平移到远处。repack 的随机性可以排除 —— 实测同一批残基连跑三次，干净结构逐位相同，最差的结构也只差 0.2 REU。
-
-⚠️ 但分开方式并不足以解释实测到的分歧幅度：多数结构两列只差零点几 REU，个别结构却差到几十 REU 且变号。**成因待查。** 在查清之前，把分歧大的结构直接判为不可用。
-
-所以 `dG_IA` 这一列的作用是**可靠性探针**：两个数越接近，说明该结构的 ΔG 越不受实现细节影响。分歧大到会改变设计之间的排序时，用 04 的重复采样取均值。
+界面判据对齐之后，两条路的差异只剩**分开方式**：脚本真拆成两个 Pose，IA 沿 jump 平移到远处。
 
 > **03 计算 ΔG：relax_yes + repack_yes**
 
@@ -244,10 +227,10 @@ Rosetta 是**单线程 CPU 密集型**，一个进程占一个核心，进程数
 #### 第一级：饱和扫描
 
 ```bash
-python /data/lmk/rosetta_scripts/batch_ddG_screen.py
+python /data/lmk/rosetta_scripts/batch_ddG_screen_antibody.py
 ```
 
-不用准备突变列表。脚本取界面**抗体侧**的残基（重原子 4 Å 判据），每个位点枚举其余 19 种氨基酸。实测一个结构约 17 个位点、323 个突变。
+不用准备突变列表。脚本取界面**抗体侧**的残基（重原子 4 Å 判据），每个位点枚举其余 19 种氨基酸。
 
 ```
 1. 选界面残基 —— 两侧全要，CB 8 Å           → repack 范围
@@ -260,13 +243,13 @@ python /data/lmk/rosetta_scripts/batch_ddG_screen.py
 
 **突变范围 ≠ repack 范围**：只突变抗体侧，但两侧都 repack。抗原侧虽不突变，但会 repack。
 
-**`dG_wt` 要抽样多次再截尾平均**（默认 20 次去掉两端各 5 个）。
+**`dG_wt` 要抽样多次再截尾平均**（脚本定义的是 20 次去掉两端各 5 个）。
 
 ### ⚠️ 插入编号：抗体必踩的坑
 
-Kabat / Chothia 编号里 CDR 常有 **H100A、H52A** 这种插入编号 —— 它和 H100、H52 是**不同的残基**。实测一个结构的界面里就有两处。
+Kabat / Chothia 编号里 CDR 常有 **H100A、H52A** 这种插入编号 —— 它和 H100、H52 是**不同的残基**。
 
-所以 csv 里 `pdb_position` 之外还有一列 **`icode`**，两列合起来才唯一定位一个残基。只记数字会让 H100 和 H100A 挤成同一行。
+所以 csv 里 `pdb_position` 之外还有一列 **`icode`**，两列合起来才唯一定位一个残基。
 
 ### ⚠️ 这一列为什么叫 `ddG_screen` 而不是 `ddG`
 
@@ -278,17 +261,15 @@ S → Y 给出 1405 REU 这种物理上无意义的数
 
 所以它**只能用于排序，不能作为 ΔΔG 报告**。报告值一律来自第二级。
 
-**跑完人工看一眼 top-N 的位点分布**：如果大半挤在同一个位点，就不该整批送第二级 —— 十几个小时全花在一个位点上没有意义。
-
 ---
 
 #### 第二级：官方 flex ddG
 
 ```bash
-python /data/lmk/rosetta_scripts/batch_ddG_flex.py
+python /data/lmk/rosetta_scripts/batch_ddG_flex_antibody.py
 ```
 
-筛选后的 csv（`ddG_selected.csv`），跑 Kortemme 实验室的 `ddG-backrub.xml`。该 XML 原样存在 `scripts/` 下，变量替换在内存里做。
+筛选后的 csv（`ddG_selected_antibody.csv`），跑 Kortemme 实验室的 `ddG-backrub.xml`。该 XML 原样存在 `scripts/` 下。
 
 ```
 1. 按 位置/链/目标氨基酸 生成 resfile
@@ -301,7 +282,7 @@ python /data/lmk/rosetta_scripts/batch_ddG_flex.py
 
 **任务粒度是一条轨迹，不是一个突变。** 按突变切的话每个任务几十小时，进程之间没法均衡。
 
-### GAM 重加权是什么
+### GAM 重加权
 
 第 4 步相减得到的是各能量项的 ΔΔG，单位是 REU，直接加起来与实验值对不上。flex ddG 的做法是把 7 个分子间项（`fa_atr`、`fa_rep`、`fa_sol`、`fa_elec` 与三个氢键项）各自过一条拟合好的 S 形曲线再求和 —— 这就是 **GAM**（generalized additive model，广义加性模型），系数由作者在 ZEMu 数据集上拟合。
 
@@ -330,12 +311,6 @@ flex ddG 整套是在 **talaris2014** 上标定的，与 01–04 不可比。
 | `backrub_trials`                              | 每条轨迹的 backrub 步数                         |
 | `cpu_time(s)`                                 | 各条轨迹耗时之和，即该突变真实占用的 CPU 时间   |
 
-### 实现要点
-
-**每条轨迹写各自的 db3。** XML 里的 `database_name` 属性会覆盖全局的 `-inout:dbms:database_name`（后者仍须给值，否则 `ReportToDB` 构建时报 inactive option）。**轨迹目录一律保留**，成功失败都不删：每条是 31 分钟 CPU 换来的，删掉就只剩 csv 里的聚合值，想换统计口径或事后排查都得重跑；失败时它更是唯一的现场。单条约 1.6 MB。
-
-**取数与重加权在 `flexddg_lib.py`**，照官方 `analyze_flex_ddG.py` 实现，纯数据处理不依赖 PyRosetta，可以脱离服务器单测。两处可验证的自洽性：双差之后**分子内项全部精确归零**（`fa_dun`、`rama`、`ref` 等与结合无关的项），GAM 与官方公式**逐位一致**。
-
 > **06 ΔΔG：抗原侧饱和突变**
 
 跟 05 **完全同一套逻辑与判据**，只是突变发生在抗原侧。脚本是独立入口，跑的时候不用带参数：
@@ -350,17 +325,15 @@ python /data/lmk/rosetta_scripts/batch_ddG_screen_antigen.py
 python /data/lmk/rosetta_scripts/batch_ddG_flex_antigen.py
 ```
 
-`*_antigen.py` 是**薄封装**，只覆盖默认值（突变侧、输入输出路径），逻辑全部复用 05 的脚本。不复制代码是有原因的：插入编号那个 bug 的教训是，重复的实现意味着每个修复都要做两遍，而漏掉的那一遍不会有人发现。
-
 ### 与 05 的差别只有一处
 
-| | 05 | 06 |
-| :--- | :--- | :--- |
-| 突变哪一侧 | 抗体（`HL_A` 下划线左边） | 抗原（右边） |
-| 位点判据 | 重原子 4 Å | 同 |
-| repack 判据 | CB 8 Å | 同 |
-| 第二级 bubble | 官方 CB 8 Å | 同 |
-| 输出文件 | `ddG_screen_results.csv`<br>`ddG_flex_results.csv` | `ddG_screen_antigen_results.csv`<br>`ddG_flex_antigen_results.csv` |
+|               | 05                                                 | 06                                                                 |
+| :------------ | :------------------------------------------------- | :----------------------------------------------------------------- |
+| 突变哪一侧    | 抗体（`HL_A` 下划线左边）                          | 抗原（`HL_A` 下划线右边）                                          |
+| 位点判据      | 重原子 4 Å                                         | 同                                                                 |
+| repack 判据   | CB 8 Å                                             | 同                                                                 |
+| 第二级 bubble | 官方 CB 8 Å                                        | 同                                                                 |
+| 输出文件      | `ddG_screen_antibody_results.csv`<br>`ddG_flex_antibody_results.csv` | `ddG_screen_antigen_results.csv`<br>`ddG_flex_antigen_results.csv` |
 
 第二级的**协议本身完全没变** —— flex ddG 按 resfile 定位残基，不关心突变落在抗体还是抗原。`--move-chain` 也不用改：它定义的是「算解离态时移开哪组链」，与突变在哪一侧无关，移开任一侧得到的都是同一个界面的解离。
 

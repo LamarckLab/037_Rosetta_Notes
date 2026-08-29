@@ -75,23 +75,23 @@ python /home/limingkai/rosetta_scripts/batch_dG_pipeline.py \
 > **05 ΔΔG 第一级：饱和扫描**
 
 ```bash
-python /home/limingkai/rosetta_scripts/batch_ddG_screen.py \
+python /home/limingkai/rosetta_scripts/batch_ddG_screen_antibody.py \
   --inputs /home/limingkai/rosetta_inputs \
-  --out /home/limingkai/rosetta_outputs/ddG_screen_results.csv \
+  --out /home/limingkai/rosetta_outputs/ddG_screen_antibody_results.csv \
   --interface HL_A \
   --side antibody \
   --nproc 32
 ```
 
-跑完人工筛选，删掉不合适的行，另存为 `/home/limingkai/rosetta_outputs/ddG_selected.csv`，再进第二级。
+跑完人工筛选，删掉不合适的行，另存为 `/home/limingkai/rosetta_outputs/ddG_selected_antibody.csv`，再进第二级。
 
 > **05 ΔΔG 第二级：官方 flex ddG**
 
 ```bash
-python /home/limingkai/rosetta_scripts/batch_ddG_flex.py \
-  --selected /home/limingkai/rosetta_outputs/ddG_selected.csv \
+python /home/limingkai/rosetta_scripts/batch_ddG_flex_antibody.py \
+  --selected /home/limingkai/rosetta_outputs/ddG_selected_antibody.csv \
   --pdb-dir /home/limingkai/rosetta_inputs \
-  --out /home/limingkai/rosetta_outputs/ddG_flex_results.csv \
+  --out /home/limingkai/rosetta_outputs/ddG_flex_antibody_results.csv \
   --xml /home/limingkai/rosetta_scripts/ddG-backrub.xml \
   --work /home/limingkai/rosetta_work/flexddg \
   --move-chain A \
@@ -106,18 +106,18 @@ python /home/limingkai/rosetta_scripts/batch_ddG_flex.py \
 201 是走公网的远程机子，SSH 一断前台任务就没了。04 与 05 动辄几小时到几天，一律挂后台：
 
 ```bash
-nohup python /home/limingkai/rosetta_scripts/batch_ddG_flex.py \
-  --selected /home/limingkai/rosetta_outputs/ddG_selected.csv \
+nohup python /home/limingkai/rosetta_scripts/batch_ddG_flex_antibody.py \
+  --selected /home/limingkai/rosetta_outputs/ddG_selected_antibody.csv \
   --pdb-dir /home/limingkai/rosetta_inputs \
-  --out /home/limingkai/rosetta_outputs/ddG_flex_results.csv \
+  --out /home/limingkai/rosetta_outputs/ddG_flex_antibody_results.csv \
   --xml /home/limingkai/rosetta_scripts/ddG-backrub.xml \
   --work /home/limingkai/rosetta_work/flexddg \
   --nproc 32 \
-  > /home/limingkai/rosetta_outputs/ddG_flex.log 2>&1 &
+  > /home/limingkai/rosetta_outputs/ddG_flex_antibody.log 2>&1 &
 ```
 
 ```bash
-tail -f /home/limingkai/rosetta_outputs/ddG_flex.log      # 看进度
+tail -f /home/limingkai/rosetta_outputs/ddG_flex_antibody.log      # 看进度
 pgrep -af batch_ddG_flex                                  # 确认还在跑
 ```
 
