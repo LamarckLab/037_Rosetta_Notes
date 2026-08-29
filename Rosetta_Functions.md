@@ -166,12 +166,12 @@ python /data/lmk/rosetta_scripts/batch_dG_repack_relax.py
 
 > **04 重复采样与并行**
 
-生产级别脚本：batch_dG_pipeline.py
+生产级别脚本：batch_dG_repack_relax_repeat.py
 
 在 03 的基础上做两件事：**每个结构重复 `NSTRUCT` 遍取统计量**，以及**按结构切分到 `NPROC` 个进程上并行**。
 
 ```bash
-python /data/lmk/rosetta_scripts/batch_dG_pipeline.py
+python /data/lmk/rosetta_scripts/batch_dG_repack_relax_repeat.py
 ```
 
 **`dG` 各列取的是 InterfaceAnalyzer 的值**，即 03 CSV 里的 `dG_IA` 那条路，不是 03 的 `dG` 列。IA 是业界通用实现，所以这里不再加 `_IA` 后缀。之前两条路都留，是为了拿到 `E_antibody` / `E_antigen`。

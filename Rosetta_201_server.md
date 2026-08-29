@@ -68,9 +68,9 @@ python /home/limingkai/rosetta_scripts/batch_dG_repack_relax.py \
 > **04 重复采样与并行**
 
 ```bash
-python /home/limingkai/rosetta_scripts/batch_dG_pipeline.py \
+python /home/limingkai/rosetta_scripts/batch_dG_repack_relax_repeat.py \
   --inputs /home/limingkai/rosetta_inputs \
-  --out /home/limingkai/rosetta_outputs/dG_pipeline_results.csv \
+  --out /home/limingkai/rosetta_outputs/dG_repack_relax_repeat_results.csv \
   --interface HL_A \
   --nstruct 5 \
   --nproc 48

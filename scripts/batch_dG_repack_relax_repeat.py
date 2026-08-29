@@ -15,7 +15,7 @@
 # ==================== 配置（日常改这里） ====================
 
 INPUTS    = '/data/lmk/rosetta_inputs'                              # 待评估的复合物 pdb 目录
-OUTPUT    = '/data/lmk/rosetta_outputs/dG_pipeline_results.csv'     # 指标输出
+OUTPUT    = '/data/lmk/rosetta_outputs/dG_repack_relax_repeat_results.csv'     # 指标输出
 INTERFACE = 'HL_A'      # 链分组，要与 pdb 实际链号一致
                         # ⚠️ 左边必须是抗体、右边是抗原，否则 CSV 里两侧的列名会对调
 # 两套判据，回答两个不同的问题，详见 interface_lib.py
