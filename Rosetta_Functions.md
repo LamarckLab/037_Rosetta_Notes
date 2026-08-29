@@ -276,22 +276,20 @@ python /data/lmk/rosetta_scripts/batch_ddG_flex_antibody.py
 2. 跑 NSTRUCT 条独立的 backrub 轨迹
 3. 每条轨迹取四个状态的逐项能量
 4. ΔΔG = (bound_mut + unbound_wt) − (bound_wt + unbound_mut)
-5. 过 ZEMu GAM 重加权 → kcal/mol
+5. 顺带过一遍 ZEMu GAM 重加权，作为对照列
 6. 对 NSTRUCT 条求均值与标准差
 ```
 
 **任务粒度是一条轨迹，不是一个突变。** 按突变切的话每个任务几十小时，进程之间没法均衡。
 
-### GAM 重加权
-
-第 4 步相减得到的是各能量项的 ΔΔG，单位是 REU，直接加起来与实验值对不上。flex ddG 的做法是把 7 个分子间项（`fa_atr`、`fa_rep`、`fa_sol`、`fa_elec` 与三个氢键项）各自过一条拟合好的 S 形曲线再求和 —— 这就是 **GAM**（generalized additive model，广义加性模型），系数由作者在 ZEMu 数据集上拟合。
+### 主指标用 REU，GAM 只作对照
 
 ```
-ddG_mean(kcal/mol)     过了 GAM，标定到 kcal/mol，与实验可比  ← 报告用这个
-ddG_raw_mean(REU)      7 项直接相加，未标定                    ← 只作对照
+ddG_mean(REU)          7 个分子间项双差后直接加和，未经标定    ← 主指标
+ddG_gam_mean(kcal/mol) 同一批数据过 ZEMu GAM 重加权            ← 只作对照
 ```
 
-论文报的 MAE ≈ 1 kcal/mol 是 GAM 之后的值。两列的符号通常一致，差得远说明这个突变落在拟合曲线的非线性区，结果要打折扣看。
+**GAM**（generalized additive model，广义加性模型）是 flex ddG 作者在 ZEMu 数据集上拟合的一层重加权：把 7 个分子间项（`fa_atr`、`fa_rep`、`fa_sol`、`fa_elec` 与三个氢键项）各自过一条 S 形曲线再求和，输出标到 kcal/mol 的尺度上。
 
 ### ⚠️ 本档用 talaris2014
 
@@ -299,17 +297,17 @@ flex ddG 整套是在 **talaris2014** 上标定的，与 01–04 不可比。
 
 ### 输出 csv 的列
 
-| 列                                            | 含义                                            |
-| :-------------------------------------------- | :---------------------------------------------- |
-| `pdb_id` / `chain` / `pdb_position` / `icode` | 突变位置；`icode` 是插入编号，多数为空          |
-| `wt_aa` / `mut_aa`                            | 原氨基酸 / 目标氨基酸                           |
-| **`ddG_mean(kcal/mol)`**                      | **业界报告值**，GAM 重加权后对 nstruct 求均值   |
-| `ddG_std(kcal/mol)`                           | nstruct 条轨迹之间的标准差                      |
-| `ddG_all(kcal/mol)`                           | 每条轨迹的原始值，分号分隔，换统计口径不必重跑  |
-| `ddG_raw_mean(REU)` / `ddG_raw_std(REU)`      | 未经 GAM 重加权的 talaris2014 加和，供对照      |
-| `nstruct_done`                                | 实际完成几条轨迹；为 0 表示该突变一条也没取到数 |
-| `backrub_trials`                              | 每条轨迹的 backrub 步数                         |
-| `cpu_time(s)`                                 | 各条轨迹耗时之和，即该突变真实占用的 CPU 时间   |
+| 列                                                 | 含义                                              |
+| :------------------------------------------------- | :------------------------------------------------ |
+| `pdb_id` / `chain` / `pdb_position` / `icode`      | 突变位置；`icode` 是插入编号，多数为空            |
+| `wt_aa` / `mut_aa`                                 | 原氨基酸 / 目标氨基酸                             |
+| **`ddG_mean(REU)`**                                | **主指标**，talaris2014 七项加和对 nstruct 求均值 |
+| `ddG_std(REU)`                                     | nstruct 条轨迹之间的标准差                        |
+| `ddG_all(REU)`                                     | 每条轨迹的原始值，分号分隔，换统计口径不必重跑    |
+| `ddG_gam_mean(kcal/mol)` / `ddG_gam_std(kcal/mol)` | 过 ZEMu GAM 重加权的结果，供对照                  |
+| `nstruct_done`                                     | 实际完成几条轨迹；为 0 表示该突变一条也没取到数   |
+| `backrub_trials`                                   | 每条轨迹的 backrub 步数                           |
+| `cpu_time(s)`                                      | 各条轨迹耗时之和，即该突变真实占用的 CPU 时间     |
 
 > **06 ΔΔG：抗原侧饱和突变**
 
@@ -327,17 +325,13 @@ python /data/lmk/rosetta_scripts/batch_ddG_flex_antigen.py
 
 ### 与 05 的差别只有一处
 
-|               | 05                                                 | 06                                                                 |
-| :------------ | :------------------------------------------------- | :----------------------------------------------------------------- |
-| 突变哪一侧    | 抗体（`HL_A` 下划线左边）                          | 抗原（`HL_A` 下划线右边）                                          |
-| 位点判据      | 重原子 4 Å                                         | 同                                                                 |
-| repack 判据   | CB 8 Å                                             | 同                                                                 |
-| 第二级 bubble | 官方 CB 8 Å                                        | 同                                                                 |
+|               | 05                                                                   | 06                                                                 |
+| :------------ | :------------------------------------------------------------------- | :----------------------------------------------------------------- |
+| 突变哪一侧    | 抗体（`HL_A` 下划线左边）                                            | 抗原（`HL_A` 下划线右边）                                          |
+| 位点判据      | 重原子 4 Å                                                           | 同                                                                 |
+| repack 判据   | CB 8 Å                                                               | 同                                                                 |
+| 第二级 bubble | 官方 CB 8 Å                                                          | 同                                                                 |
 | 输出文件      | `ddG_screen_antibody_results.csv`<br>`ddG_flex_antibody_results.csv` | `ddG_screen_antigen_results.csv`<br>`ddG_flex_antigen_results.csv` |
-
-第二级的**协议本身完全没变** —— flex ddG 按 resfile 定位残基，不关心突变落在抗体还是抗原。`--move-chain` 也不用改：它定义的是「算解离态时移开哪组链」，与突变在哪一侧无关，移开任一侧得到的都是同一个界面的解离。
-
-抗原侧的位点通常比抗体侧少：实测同一结构抗体侧 17 个、抗原侧 15 个。
 
 ---
 

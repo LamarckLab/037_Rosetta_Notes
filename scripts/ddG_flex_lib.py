@@ -13,6 +13,11 @@
 
 符号：ddG < 0 表示突变体结合更强。
 
+主指标 `ddG_mean(REU)` 是七个分子间能量项双差之后的直接加和，未经任何标定。
+`ddG_gam_*` 是同一批数据过 ZEMu GAM 重加权的结果，单位 kcal/mol，供对照 ——
+论文报的 r = 0.79 / MAE ≈ 1 kcal/mol 是 GAM 那一路的成绩，且 GAM 是逐项过
+sigmoid 再求和，**两种口径的排序可能不同**，不是等比缩放。
+
 参考 https://github.com/Kortemm  e-Lab/flex_ddG_tutorial
 """
 
@@ -52,8 +57,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flexddg_lib import ddG_from_db3
 
 KEYS = ['pdb_id', 'chain', 'pdb_position', 'icode', 'wt_aa', 'mut_aa']
-FIELDS = KEYS + ['ddG_mean(kcal/mol)', 'ddG_std(kcal/mol)', 'ddG_all(kcal/mol)',
-                 'ddG_raw_mean(REU)', 'ddG_raw_std(REU)',
+FIELDS = KEYS + ['ddG_mean(REU)', 'ddG_std(REU)', 'ddG_all(REU)',
+                 'ddG_gam_mean(kcal/mol)', 'ddG_gam_std(kcal/mol)',
                  'nstruct_done', 'backrub_trials', 'cpu_time(s)']
 
 # 官方 XML 里定义 bubble 的那一行；变体只替换它，磁盘上的文件始终与上游逐字节一致
@@ -192,12 +197,13 @@ def summarize(row, vals, trials):
     two = len(vals) > 1
     return {
         **base,
-        'ddG_mean(kcal/mol)': round(statistics.fmean(gams), 3),
-        'ddG_std(kcal/mol)': round(statistics.stdev(gams), 3) if two else 0.0,
-        # 每条轨迹的原始值，留着换统计口径（中位数、截尾均值、看分布）时不用重跑
-        'ddG_all(kcal/mol)': ';'.join(f'{g:.3f}' for g in gams),
-        'ddG_raw_mean(REU)': round(statistics.fmean(raws), 3),
-        'ddG_raw_std(REU)': round(statistics.stdev(raws), 3) if two else 0.0,
+        'ddG_mean(REU)': round(statistics.fmean(raws), 3),
+        'ddG_std(REU)': round(statistics.stdev(raws), 3) if two else 0.0,
+        # 每条轨迹的原始值，留着换统计口径（中位数、截尾均值、看分布）时不用重跑。
+        # 一条轨迹是 31 分钟 CPU，重算 35 条要 18 小时，这一列必须留
+        'ddG_all(REU)': ';'.join(f'{r:.3f}' for r in raws),
+        'ddG_gam_mean(kcal/mol)': round(statistics.fmean(gams), 3),
+        'ddG_gam_std(kcal/mol)': round(statistics.stdev(gams), 3) if two else 0.0,
     }
 
 
@@ -274,8 +280,8 @@ def main():
                 w.writerow(row)
                 f.flush()        # 每个突变算完就落盘，中断不丢
                 print(f"[{n}/{len(tasks)}] {key}  "
-                      f"ddG={row['ddG_mean(kcal/mol)']}±{row['ddG_std(kcal/mol)']} "
-                      f"kcal/mol", flush=True)
+                      f"ddG={row['ddG_mean(REU)']}±{row['ddG_std(REU)']} "
+                      f"REU", flush=True)
 
         # 收尾：凡是还没写过的突变都补一行，包括一条轨迹都没成的。
         # 输出行数与 selected.csv 永远一致，缺谁按 nstruct_done 排序即可看出
@@ -285,7 +291,7 @@ def main():
             w.writerow(row)
             f.flush()
             print(f"⚠️ {key} 只完成 {len(vals)}/{args.nstruct} 条轨迹  "
-                  f"ddG={row['ddG_mean(kcal/mol)'] or '无'}", flush=True)
+                  f"ddG={row['ddG_mean(REU)'] or '无'}", flush=True)
 
     print(f'\n总墙钟 {(time.time() - t0) / 3600:.2f} 小时')
     if fails:
