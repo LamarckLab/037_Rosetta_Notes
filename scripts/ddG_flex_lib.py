@@ -6,19 +6,25 @@
 读第一级输出（人工筛过的）csv，逐个突变按 Kortemme 实验室的 ddG-backrub.xml
 跑 NSTRUCT 条 backrub 轨迹，取数与重加权照官方 analyze_flex_ddG.py。
 
-⚠️ 本档用 **talaris2014**，不是前几档的 REF2015 —— flex ddG 整套是在 talaris2014
-上标定的，实测换 ref2015 相关性会掉（r 0.79 -> 0.57~0.68，Sora 等 2023）。这需要
-整个进程开 -corrections::restore_talaris_behavior，所以只能独立进程跑。
-**本档的数字与 01-04 的 REU 不可比。**
+⚠️ 本档用 **talaris2014**，不是前几档的 REF2015 —— flex ddG 的协议与力场是配套
+标定的，backrub 步数、nstruct、GAM 的拟合参数都随 talaris2014 一起定下来，单换
+力场就得整套重标。这需要整个进程开 -corrections::restore_talaris_behavior，所以
+只能独立进程跑。**本档的数字与 01-04 的 REU 不可比。**
+
+基准成绩（r = 预测 ΔΔG 与实验 ΔΔG 的 Pearson 相关；实验值来自 SKEMPI，由测得的
+KD 按 ΔΔG = RT·ln(KD_mut/KD_wt) 折算，多为 SPR 测定）：Barlow 2018 在 ZEMu
+（1240 个突变，自 SKEMPI 筛出）上报 r ≈ 0.65。抗体-抗原界面要低不少，有 608
+突变集上 r = 0.46（GAM）/ 0.42（不加 GAM）的报道。以上转引自检索摘要、原文未核，
+要写进材料请自行复核。
 
 符号：ddG < 0 表示突变体结合更强。
 
 主指标 `ddG_mean(REU)` 是七个分子间能量项双差之后的直接加和，未经任何标定。
 `ddG_gam_*` 是同一批数据过 ZEMu GAM 重加权的结果，单位 kcal/mol，供对照 ——
-论文报的 r = 0.79 / MAE ≈ 1 kcal/mol 是 GAM 那一路的成绩，且 GAM 是逐项过
-sigmoid 再求和，**两种口径的排序可能不同**，不是等比缩放。
+论文报的相关性是 GAM 那一路的成绩，且 GAM 是逐项过 sigmoid 再求和，
+**两种口径的排序可能不同**，不是等比缩放。
 
-参考 https://github.com/Kortemm  e-Lab/flex_ddG_tutorial
+参考 https://github.com/Kortemme-Lab/flex_ddG_tutorial
 """
 
 # ==================== 配置（日常改这里） ====================
@@ -31,7 +37,7 @@ WORK      = '/data/lmk/rosetta_work/flexddg'                    # 每条轨迹�
 
 MOVE_CHAIN     = 'A'      # 算解离态时把哪条（组）链移开，一般就是抗原
 BUBBLE         = 'cb8'    # backrub 支点与 repack 的邻域判据，围绕突变位点画：
-                          #   cb8    官方原版，邻居原子(CB) 8 Å —— r=0.79 就是它标定的
+                          #   cb8    官方原版，邻居原子(CB) 8 Å —— 论文成绩就是它跑的
                           #   atom4  任意重原子 4 Å；实测两者选出的残基数相当
                           #          （12~13 vs 13~15），但构成不同
                           # ⚠️ 改成 atom4 就不再是官方协议，论文的精度数据不适用
