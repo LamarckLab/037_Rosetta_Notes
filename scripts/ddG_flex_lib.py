@@ -248,7 +248,8 @@ def main():
     got = {}                 # key -> 成功的轨迹结果
     fails = {}               # key -> [失败次数, 首条 traceback, 现场目录]
     written = set()          # 已经落盘的突变，收尾时据此补齐剩下的
-    new_file = not os.path.exists(args.out)
+    # 判「存在」不够：0 字节的残留文件会让表头永远写不出去，之后续跑会把首行数据读成字段名
+    new_file = not (os.path.exists(args.out) and os.path.getsize(args.out) > 0)
     ctx = mp.get_context('spawn')
 
     with open(args.out, 'a', newline='', encoding='utf-8') as f:

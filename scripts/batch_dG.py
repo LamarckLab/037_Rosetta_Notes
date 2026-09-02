@@ -111,7 +111,8 @@ def main():
     print(f'界面 {args.interface}  |  共 {len(pdbs)} 个 pdb，'
           f'已完成 {len(skip)} 个，本次处理 {len(todo)} 个')
 
-    new_file = not os.path.exists(args.out)
+    # 判「存在」不够：0 字节的残留文件会让表头永远写不出去，之后续跑会把首行数据读成字段名
+    new_file = not (os.path.exists(args.out) and os.path.getsize(args.out) > 0)
     with open(args.out, 'a', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
         if new_file:

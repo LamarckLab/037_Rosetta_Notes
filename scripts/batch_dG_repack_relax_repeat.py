@@ -134,7 +134,8 @@ def main():
            'pack_crit': args.pack_criterion, 'pack_dist': args.pack_dist}
     tasks = [(p, args.interface, cfg, args.nstruct) for p in todo]
     t0 = time.time()
-    new_file = not os.path.exists(args.out)
+    # 判「存在」不够：0 字节的残留文件会让表头永远写不出去，之后续跑会把首行数据读成字段名
+    new_file = not (os.path.exists(args.out) and os.path.getsize(args.out) > 0)
 
     # spawn 而不是 fork：worker 拿到干净的解释器，不继承父进程里任何 Rosetta 状态
     ctx = mp.get_context('spawn')
